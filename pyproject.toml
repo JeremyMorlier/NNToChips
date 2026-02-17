@@ -1,0 +1,18 @@
+[project]
+name = "nntochips"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "pydot>=4.0.1",
+    "stream-dse",
+]
+
+[tool.uv.workspace]
+members = [
+    "stream",
+]
+
+[tool.uv.sources]
+stream-dse = { workspace = true, editable = true }
