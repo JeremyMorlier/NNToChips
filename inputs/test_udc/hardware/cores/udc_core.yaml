@@ -1,0 +1,153 @@
+name: udc_core
+type: compute
+memories:
+  rf_O:
+    size: 1024
+    r_cost: 0.021
+    w_cost: 0.021
+    area: 0
+    latency: 1
+    operands:
+    - O
+    served_dimensions: []
+    ports:
+    - name: r_port_1
+      type: read
+      bandwidth_min: 8
+      bandwidth_max: 8
+      allocation:
+      - O, tl
+    - name: r_port_2
+      type: read
+      bandwidth_min: 8
+      bandwidth_max: 8
+      allocation:
+      - O, th
+    - name: w_port_1
+      type: write
+      bandwidth_min: 8
+      bandwidth_max: 8
+      allocation:
+      - O, fh
+    - name: w_port_2
+      type: write
+      bandwidth_min: 8
+      bandwidth_max: 8
+      allocation:
+      - O, fl
+  rf_I1:
+    size: 1024
+    r_cost: 0.095
+    w_cost: 0.095
+    area: 0
+    latency: 1
+    operands:
+    - I1
+    served_dimensions: []
+    ports:
+    - name: r_port_1
+      type: read
+      bandwidth_min: 16
+      bandwidth_max: 16
+      allocation:
+      - I1, tl
+    - name: w_port_1
+      type: write
+      bandwidth_min: 16
+      bandwidth_max: 16
+      allocation:
+      - I1, fh
+  rf_I2:
+    size: 1024
+    r_cost: 0.095
+    w_cost: 0.095
+    area: 0
+    latency: 1
+    operands:
+    - I2
+    served_dimensions: []
+    ports:
+    - name: r_port_1
+      type: read
+      bandwidth_min: 124
+      bandwidth_max: 124
+      allocation:
+      - I2, tl
+    - name: w_port_1
+      type: write
+      bandwidth_min: 124
+      bandwidth_max: 124
+      allocation:
+      - I2, fh
+  d1_sram:
+    size: 136008
+    r_cost: 0
+    w_cost: 0
+    area: 0
+    latency: 1
+    operands:
+    - I1
+    - I2
+    - O
+    served_dimensions:
+    - D1
+    ports:
+    - name: r_port_1
+      type: read
+      bandwidth_min: 131
+      bandwidth_max: 173
+      allocation:
+      - I1, tl
+      - I2, tl
+      - O, tl
+      - O, th
+    - name: w_port_1
+      type: write
+      bandwidth_min: 131
+      bandwidth_max: 173
+      allocation:
+      - I1, fh
+      - I2, fh
+      - O, fh
+      - O, fl
+  sram:
+    size: 43514696
+    r_cost: 0
+    w_cost: 0
+    area: 0
+    latency: 1
+    operands:
+    - I1
+    - I2
+    - O
+    served_dimensions:
+    - D1
+    - D2
+    ports:
+    - name: r_port_1
+      type: read
+      bandwidth_min: 100
+      bandwidth_max: 827
+      allocation:
+      - I1, tl
+      - I2, tl
+      - O, tl
+      - O, th
+    - name: w_port_1
+      type: write
+      bandwidth_min: 100
+      bandwidth_max: 827
+      allocation:
+      - I1, fh
+      - I2, fh
+      - O, fh
+      - O, fl
+operational_array:
+  unit_energy: 0.04
+  unit_area: 1
+  dimensions:
+  - D1
+  - D2
+  sizes:
+  - 39
+  - 52
