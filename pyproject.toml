@@ -5,8 +5,16 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
+    "jinja2>=3.1.6",
+    "onnx>=1.20.1",
+    "onnxruntime>=1.24.2",
+    "onnxscript>=0.6.2",
+    "onnxsim>=0.6.2",
+    "pymoo>=0.6.1.5",
     "pydot>=4.0.1",
     "stream-dse",
+    "torch>=2.10.0",
+    "torchinfo>=1.8.0",
 ]
 
 [tool.uv.workspace]

@@ -1,0 +1,33 @@
+- name: default
+  core_allocation: [0]
+  intra_core_tiling:
+    - D, all
+  inter_core_tiling:
+    - K, *
+
+- name: /conv1/Conv
+  core_allocation: [0]
+  intra_core_tiling:
+    - OY, all
+  inter_core_tiling:
+    - K, *
+
+- name: /conv2/Conv
+  core_allocation: [2]
+  intra_core_tiling:
+    - OY, all
+  inter_core_tiling:
+    - K, *
+- name: Relu
+  core_allocation: [1]
+  intra_core_tiling:
+    - D, all
+  inter_core_tiling:
+    - K, *
+- name: Relu_1
+  core_allocation: [3]
+  intra_core_tiling:
+    - D, all
+  inter_core_tiling:
+    - K, *
+

@@ -1,0 +1,36 @@
+- name: default
+  core_allocation: [0]
+  intra_core_tiling:
+    - D, all
+  inter_core_tiling:
+    - K, *
+
+- name: /linear1/Gemm
+  core_allocation: [0]
+  intra_core_tiling:
+    - K, {{linear1_k_tile}}
+    - C, {{linear1_c_tile}}
+  inter_core_tiling:
+    - K, *
+
+- name: /linear2/Gemm
+  core_allocation: [0]
+  intra_core_tiling:
+    - K, {{linear2_k_tile}}
+    - C, {{linear2_c_tile}}
+  inter_core_tiling:
+    - K, *
+
+- name: Sigmoid
+  core_allocation: [0]
+  intra_core_tiling:
+    - H, {{sigmoid_h_tile}}
+  inter_core_tiling:
+    - H, *
+  
+- name: Mul
+  core_allocation: [0]
+  intra_core_tiling:
+    - H, {{mul_h_tile}}
+  inter_core_tiling:
+    - H, *

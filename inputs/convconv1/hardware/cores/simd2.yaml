@@ -1,0 +1,41 @@
+name: pooling
+type: compute
+
+memories:
+  sram_10KB_2rw:
+    size: 81920
+    r_cost: 60
+    w_cost: 75
+    area: 0
+    latency: 1
+    operands: [I1, I2, O]
+    ports:
+      - name: rw_port_1
+        type: read_write
+        bandwidth_min: 128
+        bandwidth_max: 128
+        allocation: 
+          - I1, fh
+          - I2, fh
+          - O, fh
+          - O, fl
+      - name: rw_port_2
+        type: read_write
+        bandwidth_min: 128
+        bandwidth_max: 128
+        allocation: 
+          - I1, tl
+          - I2, tl
+          - O, tl
+          - O, th
+    served_dimensions: [D1]
+
+operational_array:
+  unit_energy: 0.1 # pJ
+  unit_area: 0.01 # unit
+  dimensions: [D1]
+  sizes: [14]
+
+dataflows:
+  D1: 
+    - K, 114
