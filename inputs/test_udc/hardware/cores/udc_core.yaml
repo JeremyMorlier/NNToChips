@@ -36,7 +36,7 @@ memories:
       allocation:
       - O, fl
   rf_I1:
-    size: 1024
+    size: 256
     r_cost: 0.095
     w_cost: 0.095
     area: 0
@@ -58,7 +58,7 @@ memories:
       allocation:
       - I1, fh
   rf_I2:
-    size: 1024
+    size: 512
     r_cost: 0.095
     w_cost: 0.095
     area: 0
@@ -80,7 +80,7 @@ memories:
       allocation:
       - I2, fh
   d1_sram:
-    size: 136008
+    size: 893016
     r_cost: 0
     w_cost: 0
     area: 0
@@ -149,5 +149,5 @@ operational_array:
   - D1
   - D2
   sizes:
-  - 39
-  - 52
+  - 16
+  - 16

@@ -274,8 +274,8 @@ class UDCArchitectureOptimizationProblem(Problem):
         # Define bounds for each variable
         xl = np.array(
             [
-                8,  # d1_min
-                8,  # d2_min
+                1,  # d1_min
+                1,  # d2_min
                 65536,  # sram_size_min (64KB)
                 1,  # sram_min_b_min
                 0,  # sram_max_b_selector_min
@@ -285,11 +285,11 @@ class UDCArchitectureOptimizationProblem(Problem):
                 4096,  # d1_sram_size_min (4KB)
                 1,  # d1_sram_min_b_min
                 0,  # d1_sram_max_b_selector_min
-                256,  # rf_I1_size_min
+                8,  # rf_I1_size_min
                 1,  # rf_I1_bw_min
-                256,  # rf_I2_size_min
+                8,  # rf_I2_size_min
                 1,  # rf_I2_bw_min
-                16,  # rf_O_size_min
+                8,  # rf_O_size_min
                 1,  # rf_O_bw_min
                 1,  # linear1_k_tile_min
                 1,  # linear2_k_tile_min
@@ -300,8 +300,8 @@ class UDCArchitectureOptimizationProblem(Problem):
 
         xu = np.array(
             [
-                512,  # d1_max
-                512,  # d2_max
+                16,  # d1_max
+                16,  # d2_max
                 67108864,  # sram_size_max (64MB)
                 512,  # sram_min_b_max
                 511,  # sram_max_b_selector_max
@@ -311,11 +311,11 @@ class UDCArchitectureOptimizationProblem(Problem):
                 1048576,  # d1_sram_size_max (1MB)
                 256,  # d1_sram_min_b_max
                 255,  # d1_sram_max_b_selector_max
-                262144,  # rf_I1_size_max (256KB)
+                256,  # rf_I1_size_max (1/4KB)
                 128,  # rf_I1_bw_max
-                262144,  # rf_I2_size_max (256KB)
+                256,  # rf_I2_size_max (1/4KB)
                 128,  # rf_I2_bw_max
-                8192,  # rf_O_size_max (8KB)
+                256,  # rf_O_size_max (1/4KB)
                 128,  # rf_O_bw_max
                 128,  # linear1_k_tile_max
                 128,  # linear2_k_tile_max

@@ -87,6 +87,47 @@ def update_rf_memory_sizes(
     )
 
 
+def update_operational_array_sizes(core_yaml_path, d1_size=None, d2_size=None):
+    """Update operational array sizes (D1/D2) in a UDC core YAML file."""
+    with open(core_yaml_path, "r", encoding="utf-8") as f:
+        core_yaml = yaml.safe_load(f)
+
+    op_array = core_yaml.get("operational_array", {})
+    dimensions = op_array.get("dimensions", [])
+    sizes = op_array.get("sizes", [])
+
+    if len(dimensions) != len(sizes):
+        raise ValueError(
+            f"Invalid operational_array format in {core_yaml_path}: "
+            f"dimensions and sizes length mismatch"
+        )
+
+    dim_to_idx = {dim: i for i, dim in enumerate(dimensions)}
+
+    if d1_size is not None:
+        if "D1" not in dim_to_idx:
+            raise KeyError(
+                f"D1 not found in operational_array.dimensions of {core_yaml_path}"
+            )
+        sizes[dim_to_idx["D1"]] = int(d1_size)
+
+    if d2_size is not None:
+        if "D2" not in dim_to_idx:
+            raise KeyError(
+                f"D2 not found in operational_array.dimensions of {core_yaml_path}"
+            )
+        sizes[dim_to_idx["D2"]] = int(d2_size)
+
+    with open(core_yaml_path, "w", encoding="utf-8") as f:
+        yaml.safe_dump(core_yaml, f, sort_keys=False)
+    logger.info(
+        "Updated operational array sizes in %s: D1=%s  D2=%s",
+        core_yaml_path,
+        d1_size,
+        d2_size,
+    )
+
+
 def run_stream(
     accelerator,
     workload_path,
@@ -141,8 +182,8 @@ def run_stream(
     return scme
 
 
-def evaluate_rf_size(rf_i1_size, rf_i2_size, rf_o_size):
-    """Helper function to evaluate a specific RF size configuration."""
+def evaluate_rf_size(rf_i1_size, rf_i2_size, rf_o_size, d1_size=None, d2_size=None):
+    """Helper function to evaluate a specific RF/op-array size configuration."""
     core_yaml_path = Path("inputs/test_udc/hardware/cores/udc_core.yaml")
     update_rf_memory_sizes(
         core_yaml_path,
@@ -150,7 +191,13 @@ def evaluate_rf_size(rf_i1_size, rf_i2_size, rf_o_size):
         rf_i2_size=rf_i2_size,
         rf_o_size=rf_o_size,
     )
-    experiment_id = f"test_udc_rf{rf_i1_size}"
+    update_operational_array_sizes(core_yaml_path, d1_size=d1_size, d2_size=d2_size)
+
+    d1_label = d1_size if d1_size is not None else "keep"
+    d2_label = d2_size if d2_size is not None else "keep"
+    experiment_id = (
+        f"test_udc_rf{rf_i1_size}_{rf_i2_size}_{rf_o_size}_d{d1_label}_{d2_label}"
+    )
     latency, energy = None, None
     try:
         scme = run_stream(
@@ -166,7 +213,8 @@ def evaluate_rf_size(rf_i1_size, rf_i2_size, rf_o_size):
         latency, energy = scme.latency, scme.energy
     except Exception as e:
         logger.error(
-            f"RF_i1={rf_i1_size} RF_i2={rf_i2_size} RF_o={rf_o_size}  FAILED: {e}",
+            f"RF_i1={rf_i1_size} RF_i2={rf_i2_size} RF_o={rf_o_size} "
+            f"D1={d1_size} D2={d2_size} FAILED: {e}",
             exc_info=True,
         )
 
@@ -175,17 +223,9 @@ def evaluate_rf_size(rf_i1_size, rf_i2_size, rf_o_size):
 
 def main():
     ############################################INPUTS############################################
-    accelerator = "inputs/test_udc/hardware/core.yaml"
     workload_path = "inputs/test_udc/model.onnx"
-    mapping_path = "inputs/test_udc/mapping/mapping.yaml"
     dim = 1024
     hidden_dim_factor = 4
-    mode = "lbl"
-    layer_stacks = [tuple(range(0, 12)), tuple(range(12, 22))] + list(
-        (i,) for i in range(22, 49)
-    )
-    output_path = "outputs/test_udc/"
-    core_yaml_path = Path(accelerator).parent / "cores" / "udc_core.yaml"
     ##############################################################################################
 
     ########################################MODEL GENERATION######################################
@@ -216,9 +256,45 @@ def main():
     #     eng_str = f"{energy:.4e}" if energy is not None else "N/A"
     #     logger.info("%10d  %20s  %20s  %5s", rf_size, lat_str, eng_str, ok)
 
-    latency, energy = evaluate_rf_size(
-        rf_i1_size=256, rf_i2_size=256 * 2, rf_o_size=256 * 4
-    )
+    rf_i1_size = 256
+    rf_i2_size = 256 * 2
+    rf_o_size = 256 * 4
+
+    results = []
+    # latency, energy = evaluate_rf_size(
+    #     rf_i1_size=256,
+    #     rf_i2_size=256 * 2,
+    #     rf_o_size=256 * 4,
+    #     d1_size=9,
+    #     d2_size=16,
+    # )
+
+    logger.info("COMBINED SWEEP (D1=1..16, D2=1..16)")
+    for d1_size in range(1, 17):
+        for d2_size in range(1, 17):
+            latency, energy = evaluate_rf_size(
+                rf_i1_size=rf_i1_size,
+                rf_i2_size=rf_i2_size,
+                rf_o_size=rf_o_size,
+                d1_size=d1_size,
+                d2_size=d2_size,
+            )
+            results.append(
+                (
+                    d1_size,
+                    d2_size,
+                    latency,
+                    energy,
+                    latency is not None and energy is not None,
+                )
+            )
+
+    logger.info("COMBINED SWEEP SUMMARY")
+    logger.info("%6s  %6s  %20s  %20s  %5s", "D1", "D2", "latency", "energy", "ok")
+    for d1_size, d2_size, latency, energy, ok in results:
+        lat_str = f"{latency:.4e}" if latency is not None else "N/A"
+        eng_str = f"{energy:.4e}" if energy is not None else "N/A"
+        logger.info("%6d  %6d  %20s  %20s  %5s", d1_size, d2_size, lat_str, eng_str, ok)
 
 
 if __name__ == "__main__":
