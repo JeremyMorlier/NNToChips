@@ -1,0 +1,149 @@
+name: depfin2_core
+type: compute
+
+memories:
+  rf_1B_I:
+    size: 8
+    # r_cost: 1
+    # w_cost: 1.2
+    auto_cost_extraction: true
+    mem_type: rf
+    area: 0
+    latency: 1
+    operands: [I1]
+    served_dimensions: []
+    ports:
+      - name: r_port_1
+        type: read
+        bandwidth_min: 8
+        bandwidth_max: 8
+        allocation:
+          - I1, tl
+      - name: w_port_1
+        type: write
+        bandwidth_min: 8
+        bandwidth_max: 8
+        allocation:
+          - I1, fh
+
+  rf_1B_W:
+    size: 8
+    # r_cost: 1
+    # w_cost: 1.2
+    auto_cost_extraction: true
+    mem_type: rf
+    area: 0
+    latency: 1
+    operands: [I2]
+    served_dimensions: []
+    ports:
+      - name: r_port_1
+        type: read
+        bandwidth_min: 8
+        bandwidth_max: 8
+        allocation:
+          - I2, tl
+      - name: w_port_1
+        type: write
+        bandwidth_min: 8
+        bandwidth_max: 8
+        allocation:
+          - I2, fh
+
+  rf_4B:
+    size: 16
+    r_cost: 3
+    w_cost: 3.6
+    area: 0
+    latency: 1
+    operands: [O]
+    served_dimensions: []
+    ports:
+      - name: r_port_1
+        type: read
+        bandwidth_min: 16
+        bandwidth_max: 16
+        allocation:
+          - O, tl
+      - name: r_port_2
+        type: read
+        bandwidth_min: 16
+        bandwidth_max: 16
+        allocation:
+          - O, th
+      - name: w_port_1
+        type: write
+        bandwidth_min: 16
+        bandwidth_max: 16
+        allocation:
+          - O, fh
+      - name: w_port_2
+        type: write
+        bandwidth_min: 16
+        bandwidth_max: 16
+        allocation:
+          - O, fl
+
+  l1_w:
+    size: 4194304
+    r_cost: 50
+    w_cost: 55
+    # auto_cost_extraction: true
+    # mem_type: sram
+    area: 0
+    latency: 1
+    operands: [I2]
+    served_dimensions: [D1, D2]
+    ports:
+      - name: r_port_1
+        type: read
+        bandwidth_min: 128
+        bandwidth_max: 128
+        allocation:
+          - I2, tl
+      - name: w_port_1
+        type: write
+        bandwidth_min: 128
+        bandwidth_max: 128
+        allocation:
+          - I2, fh
+
+  l1_act:
+    size: 8388608
+    r_cost: 265.6
+    w_cost: 308.0
+    # auto_cost_extraction: true
+    # mem_type: sram
+    area: 0
+    latency: 1
+    operands: [I1, O]
+    served_dimensions: [D1, D2]
+    ports:
+      - name: rw_port_1
+        type: read_write
+        bandwidth_min: 64
+        bandwidth_max: 1024
+        allocation:
+          - I1, fh
+          - I1, tl
+          - O, fh
+          - O, tl
+      - name: rw_port_2
+        type: read_write
+        bandwidth_min: 64
+        bandwidth_max: 1024
+        allocation:
+          - O, fl
+          - O, th
+
+operational_array:
+  unit_energy: 0.04
+  unit_area: 1
+  dimensions: [D1, D2]
+  sizes: [128, 16]
+
+dataflows:
+  D1:
+    - OX, 128
+  D2:
+    - K, 16

@@ -1,0 +1,13 @@
+name: depfin
+
+cores:
+  0: ./cores/core.yaml
+  1: ./cores/offchip.yaml
+
+offchip_core_id: 1
+unit_energy_cost: 0
+
+core_connectivity:
+  - type: bus
+    cores: [0, 1]
+    bandwidth: 64
