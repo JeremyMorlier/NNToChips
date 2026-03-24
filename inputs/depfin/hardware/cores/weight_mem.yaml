@@ -1,0 +1,26 @@
+name: offchip
+type: memory
+
+memories:
+  dram:
+    size: 4194304
+    r_cost: 1000
+    w_cost: 1000
+    area: 0
+    latency: 1
+    operands: [I2]
+    ports:
+      - name: rw_port_1
+        type: read_write
+        bandwidth_min: 32
+        bandwidth_max: 4096
+        allocation: 
+          - I2, fh
+          - I2, tl
+    served_dimensions: [D1, D2]
+
+operational_array:
+  unit_energy: 0
+  unit_area: 0
+  dimensions: [D1, D2]
+  sizes: [0, 0]
