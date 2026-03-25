@@ -87,6 +87,37 @@ def build_variant_hardware_dir(
     render_template_to_file(template_path, variant_cores_dir / "core.yaml", params)
 
 
+def extract_memory_areas(scme):
+    """
+    Extract memory instance data (including areas) from SCME object.
+
+    Returns a dict with memory hierarchy info:
+    {
+        'memory_0': {'name': ..., 'size': ..., 'area': ..., ...},
+        'memory_1': {...},
+        ...
+    }
+    """
+    memory_data = {}
+    try:
+        core = scme.accelerator.get_core(0)
+        memory_nodes = list(core.memory_hierarchy._node.keys())
+
+        for i, mem_node in enumerate(memory_nodes):
+            mem_instance = mem_node.memory_instance
+            mem_dict = mem_instance.__dict__.copy()
+
+            # Convert non-serializable objects to strings
+            if "ports" in mem_dict:
+                mem_dict["ports"] = [str(p) for p in mem_dict["ports"]]
+
+            memory_data[f"memory_{i}"] = mem_dict
+    except Exception as e:
+        memory_data["error"] = str(e)
+
+    return memory_data
+
+
 class Depfin2ArchProblem(ElementwiseProblem):
     def __init__(self, args):
         self.args = args
@@ -163,6 +194,7 @@ class Depfin2ArchProblem(ElementwiseProblem):
         experiment_id = f"{self.args.experiment_id}/{self.run_uid}/{eval_id}"
         eval_dir = self.root_dir / eval_id
 
+        memory_areas = None
         try:
             build_variant_hardware_dir(
                 template_path=Path(self.args.template),
@@ -187,6 +219,9 @@ class Depfin2ArchProblem(ElementwiseProblem):
             )
             f = [float(scme.energy), float(scme.latency), float(scme.accelerator.area)]
 
+            # Extract memory instance areas
+            memory_areas = extract_memory_areas(scme)
+
         except Exception as exc:
             # Keep search robust: failed evaluations are dominated by valid designs.
             f = [1e30, 1e30, 1e30]
@@ -195,7 +230,15 @@ class Depfin2ArchProblem(ElementwiseProblem):
             error_path.write_text(str(exc))
 
         self.cache[key] = f
-        self.evaluations.append({"x": [int(v) for v in x], "params": params, "F": f})
+        eval_record = {
+            "x": [int(v) for v in x],
+            "params": params,
+            "F": f,
+        }
+        if memory_areas:
+            eval_record["memory_areas"] = memory_areas
+
+        self.evaluations.append(eval_record)
         out["F"] = f
         out["G"] = g
 
