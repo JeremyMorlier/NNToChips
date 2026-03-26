@@ -1,13 +1,14 @@
 import argparse
 import json
 import shutil
+from multiprocessing import Pool
 from pathlib import Path
 from uuid import uuid4
 
 import numpy as np
 from jinja2 import Environment, FileSystemLoader, StrictUndefined
 from pymoo.algorithms.moo.nsga2 import NSGA2
-from pymoo.core.problem import ElementwiseProblem
+from pymoo.core.problem import Problem
 from pymoo.core.sampling import Sampling
 from pymoo.optimize import minimize
 from stream.api import optimize_allocation_co
@@ -95,6 +96,9 @@ def parse_args():
     parser.add_argument(
         "--generations", type=int, default=8, help="Number of NSGA-II generations."
     )
+    parser.add_argument(
+        "--processes", type=int, default=4, help="Number of parallel worker processes."
+    )
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
 
@@ -162,9 +166,10 @@ def extract_memory_areas(scme):
     return memory_data
 
 
-class Depfin2ArchProblem(ElementwiseProblem):
-    def __init__(self, args):
+class Depfin2ArchProblem(Problem):
+    def __init__(self, args, n_processes=1):
         self.args = args
+        self.n_processes = n_processes
         self.run_uid = uuid4().hex[:8]
         self.root_dir = Path("outputs") / args.experiment_id / f"run_{self.run_uid}"
         self.root_dir.mkdir(parents=True, exist_ok=True)
@@ -182,6 +187,7 @@ class Depfin2ArchProblem(ElementwiseProblem):
             xl=xl,
             xu=xu,
             vtype=int,
+            elementwise_evaluation=False,
         )
         self.cache = {}
         self.evaluations = []
@@ -214,7 +220,8 @@ class Depfin2ArchProblem(ElementwiseProblem):
             "l1_act_size_units": l1_act_units,
         }
 
-    def _evaluate(self, x, out, *args, **kwargs):
+    def _single_eval(self, x):
+        """Evaluate a single individual. Used for parallel evaluation."""
         params = self._params_from_x(x)
         key = tuple(int(v) for v in x)
 
@@ -222,17 +229,13 @@ class Depfin2ArchProblem(ElementwiseProblem):
 
         if key in self.cache:
             f = self.cache[key]
-            out["F"] = f
-            out["G"] = g
-            return
+            return f, g, None, None
 
         # Penalize invalid architecture before calling stream.
         if params["l1_act_bw_max"] < params["l1_act_bw_min"]:
             f = [1e30, 1e30, 1e30]
             self.cache[key] = f
-            out["F"] = f
-            out["G"] = g
-            return
+            return f, g, None, None
 
         eval_id = f"eval_{len(self.evaluations):05d}"
         experiment_id = f"{self.args.experiment_id}/{self.run_uid}/{eval_id}"
@@ -274,23 +277,38 @@ class Depfin2ArchProblem(ElementwiseProblem):
             error_path.write_text(str(exc))
 
         self.cache[key] = f
-        eval_record = {
-            "x": [int(v) for v in x],
-            "params": params,
-            "F": f,
-        }
-        if memory_areas:
-            eval_record["memory_areas"] = memory_areas
+        return f, g, params, memory_areas
 
-        self.evaluations.append(eval_record)
-        out["F"] = f
-        out["G"] = g
+    def _evaluate(self, X, out, *args, **kwargs):
+        """Evaluate a batch of individuals using multiprocessing."""
+        with Pool(processes=self.n_processes) as pool:
+            results = pool.map(self._single_eval, X)
+
+        F = []
+        G = []
+        for x, (f, g, params, memory_areas) in zip(X, results):
+            F.append(f)
+            G.append(g)
+
+            # Record evaluation
+            eval_record = {
+                "x": [int(v) for v in x],
+                "F": f,
+            }
+            if params:
+                eval_record["params"] = params
+            if memory_areas:
+                eval_record["memory_areas"] = memory_areas
+            self.evaluations.append(eval_record)
+
+        out["F"] = np.array(F)
+        out["G"] = np.array(G)
 
 
 def main():
     args = parse_args()
 
-    problem = Depfin2ArchProblem(args)
+    problem = Depfin2ArchProblem(args, n_processes=args.processes)
     algorithm = NSGA2(pop_size=args.pop_size)
 
     # Use baseline-seeded sampling for initial population
