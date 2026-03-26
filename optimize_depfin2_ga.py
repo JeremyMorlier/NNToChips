@@ -4,11 +4,55 @@ import shutil
 from pathlib import Path
 from uuid import uuid4
 
+import numpy as np
 from jinja2 import Environment, FileSystemLoader, StrictUndefined
 from pymoo.algorithms.moo.nsga2 import NSGA2
 from pymoo.core.problem import ElementwiseProblem
+from pymoo.core.sampling import Sampling
 from pymoo.optimize import minimize
 from stream.api import optimize_allocation_co
+
+
+# Baseline configuration from inputs/depfin2/hardware/cores/core.yaml
+# Converted to design variables: [d1, d2, rf1i_units, rf1w_units, rf4_units, l1w_units, l1act_units, l1w_bw, l1act_bw_min, l1act_bw_max]
+BASELINE_X = [
+    128,  # d1_size
+    16,  # d2_size
+    1,  # rf_1b_i_units (8 bytes / 8)
+    1,  # rf_1b_w_units (8 bytes / 8)
+    2,  # rf_4b_units (16 bytes / 8)
+    524288,  # l1_w_units (4194304 bytes / 8)
+    1048576,  # l1_act_units (8388608 bytes / 8)
+    128,  # l1_w_bw
+    64,  # l1_act_bw_min
+    1024,  # l1_act_bw_max
+]
+
+
+class BaselineInitialSampling(Sampling):
+    """
+    Custom sampling that seeds 5% of the initial population with the baseline configuration.
+    """
+
+    def __init__(self, problem):
+        super().__init__()
+        self.problem = problem
+
+    def _do(self, problem, n_samples, **kwargs):
+        # Seed 5% of initial population with baseline configuration
+        n_baseline = max(1, int(np.ceil(0.05 * n_samples)))
+        X = np.zeros((n_samples, problem.n_var), dtype=int)
+
+        # Fill first n_baseline samples with baseline
+        for i in range(n_baseline):
+            X[i] = BASELINE_X
+
+        # Fill remaining samples with random values within bounds
+        for i in range(n_baseline, n_samples):
+            for j in range(problem.n_var):
+                X[i, j] = np.random.randint(problem.xl[j], problem.xu[j] + 1)
+
+        return X
 
 
 def parse_args():
@@ -249,12 +293,16 @@ def main():
     problem = Depfin2ArchProblem(args)
     algorithm = NSGA2(pop_size=args.pop_size)
 
+    # Use baseline-seeded sampling for initial population
+    sampling = BaselineInitialSampling(problem)
+
     result = minimize(
         problem,
         algorithm,
         termination=("n_gen", args.generations),
         seed=args.seed,
         verbose=True,
+        sampling=sampling,
     )
 
     out_dir = Path("outputs") / args.experiment_id / f"run_{problem.run_uid}"
@@ -284,6 +332,8 @@ def main():
         "population": args.pop_size,
         "generations": args.generations,
         "seed": args.seed,
+        "baseline_x": BASELINE_X,
+        "baseline_description": "Depfin2 baseline from inputs/depfin2/hardware/cores/core.yaml",
         "num_evaluations": len(problem.evaluations),
         "pareto_front": pareto,
         "all_evaluations": problem.evaluations,
