@@ -183,7 +183,7 @@ class Depfin2ArchProblem(Problem):
         super().__init__(
             n_var=10,
             n_obj=3,
-            n_constr=1,
+            n_constr=2,
             xl=xl,
             xu=xu,
             vtype=int,
@@ -226,16 +226,25 @@ class Depfin2ArchProblem(Problem):
         key = tuple(int(v) for v in x)
 
         g = [params["l1_act_bw_min"] - params["l1_act_bw_max"]]
+        evaluation_failed = False  # Track optimization failure
 
         if key in self.cache:
             f = self.cache[key]
-            return f, g, None, None
+            # Check if this was a failed evaluation
+            evaluation_failed = f == [1e30, 1e30, 1e30]
+            return f, g, None, None, evaluation_failed
 
         # Penalize invalid architecture before calling stream.
         if params["l1_act_bw_max"] < params["l1_act_bw_min"]:
             f = [1e30, 1e30, 1e30]
             self.cache[key] = f
-            return f, g, None, None
+            return (
+                f,
+                g,
+                None,
+                None,
+                False,
+            )  # Constraint violation, not optimization failure
 
         eval_id = f"eval_{len(self.evaluations):05d}"
         experiment_id = f"{self.args.experiment_id}/{self.run_uid}/{eval_id}"
@@ -272,12 +281,13 @@ class Depfin2ArchProblem(Problem):
         except Exception as exc:
             # Keep search robust: failed evaluations are dominated by valid designs.
             f = [1e30, 1e30, 1e30]
+            evaluation_failed = True
             error_path = eval_dir / "error.txt"
             error_path.parent.mkdir(parents=True, exist_ok=True)
             error_path.write_text(str(exc))
 
         self.cache[key] = f
-        return f, g, params, memory_areas
+        return f, g, params, memory_areas, evaluation_failed
 
     def _evaluate(self, X, out, *args, **kwargs):
         """Evaluate a batch of individuals using multiprocessing."""
@@ -286,9 +296,13 @@ class Depfin2ArchProblem(Problem):
 
         F = []
         G = []
-        for x, (f, g, params, memory_areas) in zip(X, results):
+        for x, (f, g, params, memory_areas, evaluation_failed) in zip(X, results):
             F.append(f)
-            G.append(g)
+            # Add second constraint: 0 if evaluation succeeded, 1 if failed
+            # (constraint g <= 0 is satisfied)
+            g_constraint = 1.0 if evaluation_failed else 0.0
+            constraints = g + [g_constraint]
+            G.append(constraints)
 
             # Record evaluation
             eval_record = {
@@ -302,7 +316,7 @@ class Depfin2ArchProblem(Problem):
             self.evaluations.append(eval_record)
 
         F_array = np.array(F)
-
+        print(F_array)
         # Min-max normalization for each objective
         # Normalize to [0, 1] range using (x - min) / (max - min)
         for obj_idx in range(3):  # 3 objectives: energy, latency, area
