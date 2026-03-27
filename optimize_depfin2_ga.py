@@ -301,7 +301,27 @@ class Depfin2ArchProblem(Problem):
                 eval_record["memory_areas"] = memory_areas
             self.evaluations.append(eval_record)
 
-        out["F"] = np.array(F)
+        F_array = np.array(F)
+
+        # Min-max normalization for each objective
+        # Normalize to [0, 1] range using (x - min) / (max - min)
+        for obj_idx in range(3):  # 3 objectives: energy, latency, area
+            obj_values = F_array[:, obj_idx]
+            # Filter out penalty values (1e30) for min/max calculation
+            valid_values = obj_values[obj_values < 1e20]
+
+            if len(valid_values) > 0:
+                obj_min = np.min(valid_values)
+                obj_max = np.max(valid_values)
+
+                if obj_max > obj_min:
+                    # Normalize valid values
+                    F_array[obj_values < 1e20, obj_idx] = (
+                        obj_values[obj_values < 1e20] - obj_min
+                    ) / (obj_max - obj_min)
+                # If min == max, values stay as 0 (or keep original if all same)
+
+        out["F"] = F_array
         out["G"] = np.array(G)
 
 
