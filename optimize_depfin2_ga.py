@@ -1,7 +1,6 @@
 import argparse
 import json
 import logging
-import os
 import shutil
 from multiprocessing import Pool
 from os import getpid
@@ -55,6 +54,9 @@ class BaselineInitialSampling(Sampling):
         for i in range(n_baseline, n_samples):
             for j in range(problem.n_var):
                 X[i, j] = np.random.randint(problem.xl[j], problem.xu[j] + 1)
+
+        print("Initial population X:")
+        print(X)
 
         return X
 
@@ -194,6 +196,25 @@ class Depfin2ArchProblem(Problem):
         )
         self.cache = {}
         self.evaluations = []
+        self.last_normalization_bounds = [None, None, None]
+
+    def denormalize_f(self, f_values):
+        """Convert normalized objective values back to physical units."""
+        denorm = []
+        for obj_idx, value in enumerate(f_values):
+            value = float(value)
+            bounds = self.last_normalization_bounds[obj_idx]
+            if value >= 1e20 or bounds is None:
+                denorm.append(value)
+                continue
+
+            obj_min, obj_max = bounds
+            if obj_max > obj_min:
+                denorm.append(value * (obj_max - obj_min) + obj_min)
+            else:
+                denorm.append(obj_min)
+
+        return denorm
 
     def _params_from_x(self, x):
         rf_1b_i_units = int(x[2])
@@ -392,7 +413,7 @@ class Depfin2ArchProblem(Problem):
         if valid_evals > 0:
             valid_mask = np.all(F_array < 1e20, axis=1)
             valid_F = F_array[valid_mask]
-            logging.info(f"Objective statistics (valid evals only):")
+            logging.info("Objective statistics (valid evals only):")
             logging.info(
                 f"  Energy: min={valid_F[:, 0].min():.2f}, max={valid_F[:, 0].max():.2f}, mean={valid_F[:, 0].mean():.2f} pJ"
             )
@@ -405,6 +426,7 @@ class Depfin2ArchProblem(Problem):
 
         # Min-max normalization for each objective
         # Normalize to [0, 1] range using (x - min) / (max - min)
+        self.last_normalization_bounds = [None, None, None]
         for obj_idx in range(3):  # 3 objectives: energy, latency, area
             obj_values = F_array[:, obj_idx]
             # Filter out penalty values (1e30) for min/max calculation
@@ -413,6 +435,10 @@ class Depfin2ArchProblem(Problem):
             if len(valid_values) > 0:
                 obj_min = np.min(valid_values)
                 obj_max = np.max(valid_values)
+                self.last_normalization_bounds[obj_idx] = (
+                    float(obj_min),
+                    float(obj_max),
+                )
 
                 if obj_max > obj_min:
                     # Normalize valid values
@@ -433,31 +459,31 @@ def main():
         level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
     )
 
-    logging.info(f"Starting NSGA-II optimization for depfin2 architecture")
+    logging.info("Starting NSGA-II optimization for depfin2 architecture")
     logging.info(
         f"Configuration: pop_size={args.pop_size}, generations={args.generations}, processes={args.processes}"
     )
-    logging.info(f"Template: {args.template}")
-    logging.info(f"Workload: {args.workload}")
-    logging.info(f"Baseline enabled: 5% of initial population")
+    logging.info("Template: {args.template}")
+    logging.info("Workload: {args.workload}")
+    logging.info("Baseline enabled: 5% of initial population")
 
     problem = Depfin2ArchProblem(args, n_processes=args.processes)
     logging.info(
         f"Problem initialized: run_id={problem.run_uid}, {problem.n_var} variables, {problem.n_obj} objectives, {problem.n_constr} constraints"
     )
-    algorithm = NSGA2(pop_size=args.pop_size)
 
     # Use baseline-seeded sampling for initial population
     sampling = BaselineInitialSampling(problem)
 
-    logging.info(f"Starting optimization with NSGA-II...")
+    algorithm = NSGA2(pop_size=args.pop_size, sampling=sampling)
+
+    logging.info("Starting optimization with NSGA-II...")
     result = minimize(
         problem,
         algorithm,
         termination=("n_gen", args.generations),
         seed=args.seed,
         verbose=True,
-        sampling=sampling,
     )
 
     logging.info(
@@ -474,13 +500,14 @@ def main():
         logging.info(f"Extracting Pareto front with {len(xs)} solutions")
         for x, f in zip(xs, fs):
             params = problem._params_from_x(x)
+            denorm_f = problem.denormalize_f(f)
             pareto.append(
                 {
                     "x": [int(v) for v in x],
                     "params": params,
-                    "energy": float(f[0]),
-                    "latency": float(f[1]),
-                    "area": float(f[2]),
+                    "energy": float(denorm_f[0]),
+                    "latency": float(denorm_f[1]),
+                    "area": float(denorm_f[2]),
                 }
             )
 
@@ -521,7 +548,7 @@ def main():
     logging.info(f"Evaluations: {len(problem.evaluations)}")
     logging.info(f"Pareto points: {len(pareto)}")
     logging.info(f"Summary saved to: {summary_path}")
-    logging.info(f"Optimization finished successfully")
+    logging.info("Optimization finished successfully")
 
 
 if __name__ == "__main__":
