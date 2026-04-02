@@ -1,7 +1,10 @@
 import argparse
 import json
+import logging
+import os
 import shutil
 from multiprocessing import Pool
+from os import getpid
 from pathlib import Path
 from uuid import uuid4
 
@@ -222,8 +225,47 @@ class Depfin2ArchProblem(Problem):
 
     def _single_eval(self, x):
         """Evaluate a single individual. Used for parallel evaluation."""
+        # Setup logging for this specific evaluation - per-process logging
+        pid = getpid()
+        eval_id = f"eval_{len(self.evaluations):05d}"
+        log_folder = self.root_dir / f"logs/{pid}/"
+        log_folder.mkdir(parents=True, exist_ok=True)
+
+        # Configure the root logger to capture ALL logging from this process and all modules underneath
+        root_logger = logging.getLogger()
+
+        # Remove existing handlers from root logger to avoid duplicates
+        root_logger.handlers = []
+
+        # Set root logger to DEBUG level to allow ALL messages through to handlers
+        root_logger.setLevel(logging.DEBUG)
+
+        # Handler for ERROR level and above - goes to error log file
+        error_handler = logging.FileHandler(log_folder / f"{eval_id}_error.log")
+        error_handler.setLevel(logging.ERROR)
+
+        # Handler for WARNING level and above - goes to warning log file (captures WARNING, ERROR, CRITICAL)
+        warning_handler = logging.FileHandler(log_folder / f"{eval_id}_warning.log")
+        warning_handler.setLevel(logging.WARNING)
+
+        # Handler for INFO level and above - goes to info log file (captures INFO, WARNING, ERROR, CRITICAL)
+        info_handler = logging.FileHandler(log_folder / f"{eval_id}_info.log")
+        info_handler.setLevel(logging.INFO)
+
+        formatter = logging.Formatter(
+            "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+        )
+        error_handler.setFormatter(formatter)
+        warning_handler.setFormatter(formatter)
+        info_handler.setFormatter(formatter)
+        root_logger.addHandler(error_handler)
+        root_logger.addHandler(warning_handler)
+        root_logger.addHandler(info_handler)
+
         params = self._params_from_x(x)
         key = tuple(int(v) for v in x)
+
+        logging.info(f"{eval_id}: x={[int(v) for v in x]}")
 
         g = [params["l1_act_bw_min"] - params["l1_act_bw_max"]]
         evaluation_failed = False  # Track optimization failure
@@ -232,12 +274,21 @@ class Depfin2ArchProblem(Problem):
             f = self.cache[key]
             # Check if this was a failed evaluation
             evaluation_failed = f == [1e30, 1e30, 1e30]
+            if evaluation_failed:
+                logging.warning(f"{eval_id}: Cached failed evaluation")
+            else:
+                logging.info(
+                    f"{eval_id}: Using cached result - energy={f[0]:.2f}, latency={f[1]:.0f}, area={f[2]:.4f}"
+                )
             return f, g, None, None, evaluation_failed
 
         # Penalize invalid architecture before calling stream.
         if params["l1_act_bw_max"] < params["l1_act_bw_min"]:
             f = [1e30, 1e30, 1e30]
             self.cache[key] = f
+            logging.warning(
+                f"{eval_id}: Constraint violation - l1_act_bw_max ({params['l1_act_bw_max']}) < l1_act_bw_min ({params['l1_act_bw_min']})"
+            )
             return (
                 f,
                 g,
@@ -246,9 +297,14 @@ class Depfin2ArchProblem(Problem):
                 False,
             )  # Constraint violation, not optimization failure
 
-        eval_id = f"eval_{len(self.evaluations):05d}"
         experiment_id = f"{self.args.experiment_id}/{self.run_uid}/{eval_id}"
         eval_dir = self.root_dir / eval_id
+
+        logging.info(f"{eval_id}: Building variant hardware directory...")
+        logging.info(
+            f"{eval_id}: Parameters - d1={params['d1_size']}, d2={params['d2_size']}, "
+            f"l1_w_bw={params['l1_w_bw']}, l1_act_bw={params['l1_act_bw_min']}-{params['l1_act_bw_max']}"
+        )
 
         memory_areas = None
         try:
@@ -258,11 +314,13 @@ class Depfin2ArchProblem(Problem):
                 out_dir=eval_dir,
                 params=params,
             )
+            logging.info(f"{eval_id}: Hardware directory built successfully")
 
             layer_stacks = [tuple(range(0, 12)), tuple(range(12, 22))] + [
                 (i,) for i in range(22, 49)
             ]
 
+            logging.info(f"{eval_id}: Launching STREAM evaluation...")
             scme = optimize_allocation_co(
                 hardware=str(eval_dir / "hardware" / "soc.yaml"),
                 workload=self.args.workload,
@@ -278,6 +336,10 @@ class Depfin2ArchProblem(Problem):
             # Extract memory instance areas
             memory_areas = extract_memory_areas(scme)
 
+            logging.info(
+                f"{eval_id}: Success - energy={f[0]:.2f}pJ, latency={f[1]:.0f}cycles, area={f[2]:.4f}mm²"
+            )
+
         except Exception as exc:
             # Keep search robust: failed evaluations are dominated by valid designs.
             f = [1e30, 1e30, 1e30]
@@ -285,8 +347,10 @@ class Depfin2ArchProblem(Problem):
             error_path = eval_dir / "error.txt"
             error_path.parent.mkdir(parents=True, exist_ok=True)
             error_path.write_text(str(exc))
+            logging.error(f"{eval_id}: Evaluation failed with exception: {exc}")
 
         self.cache[key] = f
+        logging.info(f"{eval_id}: Evaluation complete - x={[int(v) for v in x]}, f={f}")
         return f, g, params, memory_areas, evaluation_failed
 
     def _evaluate(self, X, out, *args, **kwargs):
@@ -316,7 +380,29 @@ class Depfin2ArchProblem(Problem):
             self.evaluations.append(eval_record)
 
         F_array = np.array(F)
-        print(F_array)
+
+        # Log batch summary
+        valid_evals = np.sum(np.all(F_array < 1e20, axis=1))
+        failed_evals = len(F_array) - valid_evals
+        logging.info(
+            f"Batch evaluated: {len(F_array)} designs, {valid_evals} valid, {failed_evals} failed"
+        )
+
+        # Log objective statistics for valid evaluations
+        if valid_evals > 0:
+            valid_mask = np.all(F_array < 1e20, axis=1)
+            valid_F = F_array[valid_mask]
+            logging.info(f"Objective statistics (valid evals only):")
+            logging.info(
+                f"  Energy: min={valid_F[:, 0].min():.2f}, max={valid_F[:, 0].max():.2f}, mean={valid_F[:, 0].mean():.2f} pJ"
+            )
+            logging.info(
+                f"  Latency: min={valid_F[:, 1].min():.0f}, max={valid_F[:, 1].max():.0f}, mean={valid_F[:, 1].mean():.0f} cycles"
+            )
+            logging.info(
+                f"  Area: min={valid_F[:, 2].min():.4f}, max={valid_F[:, 2].max():.4f}, mean={valid_F[:, 2].mean():.4f} mm²"
+            )
+
         # Min-max normalization for each objective
         # Normalize to [0, 1] range using (x - min) / (max - min)
         for obj_idx in range(3):  # 3 objectives: energy, latency, area
@@ -342,12 +428,29 @@ class Depfin2ArchProblem(Problem):
 def main():
     args = parse_args()
 
+    # Setup main logging to console
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+    )
+
+    logging.info(f"Starting NSGA-II optimization for depfin2 architecture")
+    logging.info(
+        f"Configuration: pop_size={args.pop_size}, generations={args.generations}, processes={args.processes}"
+    )
+    logging.info(f"Template: {args.template}")
+    logging.info(f"Workload: {args.workload}")
+    logging.info(f"Baseline enabled: 5% of initial population")
+
     problem = Depfin2ArchProblem(args, n_processes=args.processes)
+    logging.info(
+        f"Problem initialized: run_id={problem.run_uid}, {problem.n_var} variables, {problem.n_obj} objectives, {problem.n_constr} constraints"
+    )
     algorithm = NSGA2(pop_size=args.pop_size)
 
     # Use baseline-seeded sampling for initial population
     sampling = BaselineInitialSampling(problem)
 
+    logging.info(f"Starting optimization with NSGA-II...")
     result = minimize(
         problem,
         algorithm,
@@ -357,6 +460,10 @@ def main():
         sampling=sampling,
     )
 
+    logging.info(
+        f"Optimization completed. Total evaluations: {len(problem.evaluations)}"
+    )
+
     out_dir = Path("outputs") / args.experiment_id / f"run_{problem.run_uid}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -364,6 +471,7 @@ def main():
         pareto = []
         xs = result.X.tolist() if hasattr(result.X, "tolist") else [result.X]
         fs = result.F.tolist() if hasattr(result.F, "tolist") else [result.F]
+        logging.info(f"Extracting Pareto front with {len(xs)} solutions")
         for x, f in zip(xs, fs):
             params = problem._params_from_x(x)
             pareto.append(
@@ -374,6 +482,21 @@ def main():
                     "latency": float(f[1]),
                     "area": float(f[2]),
                 }
+            )
+
+        # Log pareto front statistics
+        if pareto:
+            energies = [p["energy"] for p in pareto]
+            latencies = [p["latency"] for p in pareto]
+            areas = [p["area"] for p in pareto]
+            logging.info(
+                f"Pareto front energy range: {min(energies):.2f} - {max(energies):.2f} pJ"
+            )
+            logging.info(
+                f"Pareto front latency range: {min(latencies):.0f} - {max(latencies):.0f} cycles"
+            )
+            logging.info(
+                f"Pareto front area range: {min(areas):.4f} - {max(areas):.4f} mm²"
             )
     else:
         pareto = []
@@ -394,10 +517,11 @@ def main():
     summary_path = out_dir / "ga_summary.json"
     summary_path.write_text(json.dumps(summary, indent=2))
 
-    print(f"Run UID: {problem.run_uid}")
-    print(f"Evaluations: {len(problem.evaluations)}")
-    print(f"Pareto points: {len(pareto)}")
-    print(f"Summary: {summary_path}")
+    logging.info(f"Run UID: {problem.run_uid}")
+    logging.info(f"Evaluations: {len(problem.evaluations)}")
+    logging.info(f"Pareto points: {len(pareto)}")
+    logging.info(f"Summary saved to: {summary_path}")
+    logging.info(f"Optimization finished successfully")
 
 
 if __name__ == "__main__":
