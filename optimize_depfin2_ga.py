@@ -2,10 +2,9 @@ import argparse
 import json
 import logging
 import shutil
+from datetime import datetime
 from multiprocessing import Pool
-from os import getpid
 from pathlib import Path
-from uuid import uuid4
 
 import numpy as np
 from jinja2 import Environment, FileSystemLoader, StrictUndefined
@@ -18,6 +17,11 @@ from stream.api import optimize_allocation_co
 
 # Baseline configuration from inputs/depfin2/hardware/cores/core.yaml
 # Converted to design variables: [d1, d2, rf1i_units, rf1w_units, rf4_units, l1w_units, l1act_units, l1w_bw, l1act_bw_min, l1act_bw_max]
+def generate_run_id():
+    """Generate run ID in format YYYYMMDD_HHMM."""
+    return datetime.now().strftime("%Y%m%d_%H%M")
+
+
 BASELINE_X = [
     128,  # d1_size
     16,  # d2_size
@@ -175,7 +179,7 @@ class Depfin2ArchProblem(Problem):
     def __init__(self, args, n_processes=1):
         self.args = args
         self.n_processes = n_processes
-        self.run_uid = uuid4().hex[:8]
+        self.run_uid = generate_run_id()
         self.root_dir = Path("outputs") / args.experiment_id / f"run_{self.run_uid}"
         self.root_dir.mkdir(parents=True, exist_ok=True)
 
@@ -197,6 +201,7 @@ class Depfin2ArchProblem(Problem):
         self.cache = {}
         self.evaluations = []
         self.last_normalization_bounds = [None, None, None]
+        self.generation_idx = 0
 
     def denormalize_f(self, f_values):
         """Convert normalized objective values back to physical units."""
@@ -244,12 +249,14 @@ class Depfin2ArchProblem(Problem):
             "l1_act_size_units": l1_act_units,
         }
 
-    def _single_eval(self, x):
+    def _single_eval(self, task):
         """Evaluate a single individual. Used for parallel evaluation."""
-        # Setup logging for this specific evaluation - per-process logging
-        pid = getpid()
-        eval_id = f"eval_{len(self.evaluations):05d}"
-        log_folder = self.root_dir / f"logs/{pid}/"
+        eval_id, x = task
+        x = [int(v) for v in x]
+        eval_dir = self.root_dir / eval_id
+
+        # Store logs together with each STREAM evaluation artifacts.
+        log_folder = eval_dir / "logs"
         log_folder.mkdir(parents=True, exist_ok=True)
 
         # Configure the root logger to capture ALL logging from this process and all modules underneath
@@ -262,15 +269,15 @@ class Depfin2ArchProblem(Problem):
         root_logger.setLevel(logging.DEBUG)
 
         # Handler for ERROR level and above - goes to error log file
-        error_handler = logging.FileHandler(log_folder / f"{eval_id}_error.log")
+        error_handler = logging.FileHandler(log_folder / "error.log")
         error_handler.setLevel(logging.ERROR)
 
         # Handler for WARNING level and above - goes to warning log file (captures WARNING, ERROR, CRITICAL)
-        warning_handler = logging.FileHandler(log_folder / f"{eval_id}_warning.log")
+        warning_handler = logging.FileHandler(log_folder / "warning.log")
         warning_handler.setLevel(logging.WARNING)
 
         # Handler for INFO level and above - goes to info log file (captures INFO, WARNING, ERROR, CRITICAL)
-        info_handler = logging.FileHandler(log_folder / f"{eval_id}_info.log")
+        info_handler = logging.FileHandler(log_folder / "info.log")
         info_handler.setLevel(logging.INFO)
 
         formatter = logging.Formatter(
@@ -284,9 +291,9 @@ class Depfin2ArchProblem(Problem):
         root_logger.addHandler(info_handler)
 
         params = self._params_from_x(x)
-        key = tuple(int(v) for v in x)
+        key = tuple(x)
 
-        logging.info(f"{eval_id}: x={[int(v) for v in x]}")
+        logging.info(f"{eval_id}: x={x}")
 
         g = [params["l1_act_bw_min"] - params["l1_act_bw_max"]]
         evaluation_failed = False  # Track optimization failure
@@ -318,9 +325,6 @@ class Depfin2ArchProblem(Problem):
                 False,
             )  # Constraint violation, not optimization failure
 
-        experiment_id = f"{self.args.experiment_id}/{self.run_uid}/{eval_id}"
-        eval_dir = self.root_dir / eval_id
-
         logging.info(f"{eval_id}: Building variant hardware directory...")
         logging.info(
             f"{eval_id}: Parameters - d1={params['d1_size']}, d2={params['d2_size']}, "
@@ -342,13 +346,15 @@ class Depfin2ArchProblem(Problem):
             ]
 
             logging.info(f"{eval_id}: Launching STREAM evaluation...")
+            # Use a relative path from outputs to ensure STREAM outputs to the same folder as hardware
+            rel_path = eval_dir.relative_to("outputs")
             scme = optimize_allocation_co(
                 hardware=str(eval_dir / "hardware" / "soc.yaml"),
                 workload=self.args.workload,
                 mapping=self.args.mapping,
                 mode="fused",
                 layer_stacks=layer_stacks,
-                experiment_id=experiment_id,
+                experiment_id=str(rel_path),
                 output_path="outputs",
                 skip_if_exists=False,
             )
@@ -371,17 +377,24 @@ class Depfin2ArchProblem(Problem):
             logging.error(f"{eval_id}: Evaluation failed with exception: {exc}")
 
         self.cache[key] = f
-        logging.info(f"{eval_id}: Evaluation complete - x={[int(v) for v in x]}, f={f}")
+        logging.info(f"{eval_id}: Evaluation complete - x={x}, f={f}")
         return f, g, params, memory_areas, evaluation_failed
 
     def _evaluate(self, X, out, *args, **kwargs):
         """Evaluate a batch of individuals using multiprocessing."""
+        eval_tasks = []
+        for individual_idx, x in enumerate(X):
+            eval_id = f"g{self.generation_idx:03d}_i{individual_idx:03d}"
+            eval_tasks.append((eval_id, x))
+
         with Pool(processes=self.n_processes) as pool:
-            results = pool.map(self._single_eval, X)
+            results = pool.map(self._single_eval, eval_tasks)
 
         F = []
         G = []
-        for x, (f, g, params, memory_areas, evaluation_failed) in zip(X, results):
+        for (eval_id, x), (f, g, params, memory_areas, evaluation_failed) in zip(
+            eval_tasks, results
+        ):
             F.append(f)
             # Add second constraint: 0 if evaluation succeeded, 1 if failed
             # (constraint g <= 0 is satisfied)
@@ -391,6 +404,7 @@ class Depfin2ArchProblem(Problem):
 
             # Record evaluation
             eval_record = {
+                "eval_id": eval_id,
                 "x": [int(v) for v in x],
                 "F": f,
             }
@@ -399,6 +413,8 @@ class Depfin2ArchProblem(Problem):
             if memory_areas:
                 eval_record["memory_areas"] = memory_areas
             self.evaluations.append(eval_record)
+
+        self.generation_idx += 1
 
         F_array = np.array(F)
 
