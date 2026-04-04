@@ -65,11 +65,29 @@ plot_memory_usage(
 # Save json for perfetto visualization (Visualize at http://ui.perfetto.dev/)
 convert_scme_to_perfetto_json(scme, cost_lut, json_path=json_path)
 print(scme)
+print(scme.latency, scme.energy, scme.accelerator.area)
 print(
-    scme.latency,
-    scme.energy,
-    scme.accelerator.area,
     list(scme.accelerator.get_core(0).memory_hierarchy._node.keys())[
         0
-    ].memory_instance.__dict__,
+    ].memory_instance.__dict__
+)
+print(
+    list(scme.accelerator.get_core(0).memory_hierarchy._node.keys())[
+        1
+    ].memory_instance.__dict__
+)
+print(
+    list(scme.accelerator.get_core(0).memory_hierarchy._node.keys())[
+        2
+    ].memory_instance.__dict__
+)
+print(
+    list(scme.accelerator.get_core(0).memory_hierarchy._node.keys())[
+        3
+    ].memory_instance.__dict__
+)
+print(
+    list(scme.accelerator.get_core(0).memory_hierarchy._node.keys())[
+        4
+    ].memory_instance.__dict__
 )
