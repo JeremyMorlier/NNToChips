@@ -2,24 +2,16 @@ import argparse
 import json
 import logging
 import shutil
-from datetime import datetime
 from multiprocessing import Pool
 from pathlib import Path
 
 import numpy as np
-from jinja2 import Environment, FileSystemLoader, StrictUndefined
 from pymoo.algorithms.moo.nsga2 import NSGA2
 from pymoo.core.problem import Problem
 from pymoo.core.sampling import Sampling
 from pymoo.optimize import minimize
 from stream.api import optimize_allocation_co
-
-
-# Baseline configuration from inputs/depfin2/hardware/cores/core.yaml
-# Converted to design variables: [d1, d2, rf1i_units, rf1w_units, rf4_units, l1w_units, l1act_units, l1w_bw, l1act_bw_min, l1act_bw_max]
-def generate_run_id():
-    """Generate run ID in format YYYYMMDD_HHMM."""
-    return datetime.now().strftime("%Y%m%d_%H%M")
+from utils import generate_run_id, render_template_to_file
 
 
 BASELINE_X = [
@@ -110,20 +102,6 @@ def parse_args():
     )
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
-
-
-def render_template_to_file(template_path: Path, output_path: Path, context: dict):
-    env = Environment(
-        loader=FileSystemLoader(str(template_path.parent)),
-        undefined=StrictUndefined,
-        trim_blocks=True,
-        lstrip_blocks=True,
-    )
-    template = env.get_template(template_path.name)
-    rendered = template.render(**context)
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(rendered)
 
 
 def build_variant_hardware_dir(
@@ -479,8 +457,8 @@ def main():
     logging.info(
         f"Configuration: pop_size={args.pop_size}, generations={args.generations}, processes={args.processes}"
     )
-    logging.info("Template: {args.template}")
-    logging.info("Workload: {args.workload}")
+    logging.info(f"Template: {args.template}")
+    logging.info(f"Workload: {args.workload}")
     logging.info("Baseline enabled: 5% of initial population")
 
     problem = Depfin2ArchProblem(args, n_processes=args.processes)

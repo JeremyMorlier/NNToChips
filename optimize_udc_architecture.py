@@ -3,16 +3,13 @@ Universal Dataflow Accelerator Architecture Optimization using Genetic Algorithm
 """
 
 import argparse
-import csv
 import shutil
 from multiprocessing import Pool
-from os import getpid
 from pathlib import Path
 from uuid import uuid4
 import numpy as np
 from torch import nn
 import torch
-from jinja2 import Template
 from pymoo.algorithms.moo.nsga2 import NSGA2
 from pymoo.core.problem import Problem
 from pymoo.operators.crossover.binx import BinomialCrossover
@@ -25,6 +22,7 @@ import yaml
 
 from stream.api import optimize_allocation_co
 from udc import array_to_hardware
+from utils import render_template_to_file, save_history_csv, save_pareto_results_csv
 
 
 class MLP_model(nn.Module):
@@ -127,23 +125,18 @@ def render_mapping_from_template(
         sigmoid_h_tile: H dimension tile size for sigmoid layer
         mul_h_tile: H dimension tile size for multiplication layer
     """
-    with open(template_path, "r", encoding="utf-8") as f:
-        template = Template(f.read())
-
-    rendered_mapping = template.render(
-        linear1_k_tile=linear1_k_tile,
-        linear1_c_tile=linear1_c_tile,
-        linear2_k_tile=linear2_k_tile,
-        linear2_c_tile=linear2_c_tile,
-        sigmoid_h_tile=sigmoid_h_tile,
-        mul_h_tile=mul_h_tile,
+    return render_template_to_file(
+        template_path,
+        output_path,
+        {
+            "linear1_k_tile": linear1_k_tile,
+            "linear1_c_tile": linear1_c_tile,
+            "linear2_k_tile": linear2_k_tile,
+            "linear2_c_tile": linear2_c_tile,
+            "sigmoid_h_tile": sigmoid_h_tile,
+            "mul_h_tile": mul_h_tile,
+        },
     )
-
-    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-    with open(output_path, "w", encoding="utf-8") as f:
-        f.write(rendered_mapping)
-
-    return output_path
 
 
 def run_stream_with_udc_hardware(
@@ -393,9 +386,7 @@ class UDCArchitectureOptimizationProblem(Problem):
         sigmoid_h_tile = int(decoded_x[19])
         mul_h_tile = int(decoded_x[20])
 
-        experiment_id = (
-            f"{self.base_experiment_id}_ga_eval_{getpid()}_{uuid4().hex[:8]}"
-        )
+        experiment_id = f"{self.base_experiment_id}_ga_eval_{uuid4().hex[:8]}"
 
         try:
             _, latency, energy = run_stream_with_udc_hardware(
@@ -417,50 +408,6 @@ class UDCArchitectureOptimizationProblem(Problem):
             objective = penalty, penalty
 
         return objective
-
-    @staticmethod
-    def _compute_simple_constraints_scalar(x):
-        """Compute simple scalar constraints for one individual (G <= 0)."""
-        sram_size = float(x[2])
-        d2_sram_size = float(x[5])
-        d1_sram_size = float(x[8])
-        rf_I1_size = float(x[11])
-        rf_I2_size = float(x[13])
-        rf_O_size = float(x[15])
-
-        # Compute / memory / area constraints
-        # compute = d1 * d2
-        # g_compute = compute - 131072.0
-
-        # total_memory = (
-        #     sram_size
-        #     + d2_sram_size
-        #     + d1_sram_size
-        #     + rf_I1_size * d1 * d2
-        #     + rf_I2_size * d1 * d2
-        #     + rf_O_size * d1
-        # )
-        # g_memory = total_memory - (8 * 1024 * 1024 * 8)
-
-        # total_area_um2 = compute * 400.0 + total_memory * 0.022
-        # g_area = total_area_um2 - 500_000.0
-
-        # Memory alignment constraints: all memory sizes are multiples of 8
-        g_sram_size_mod8 = sram_size % 8.0
-        g_d2_sram_size_mod8 = d2_sram_size % 8.0
-        g_d1_sram_size_mod8 = d1_sram_size % 8.0
-        g_rf_I1_size_mod8 = rf_I1_size % 8.0
-        g_rf_I2_size_mod8 = rf_I2_size % 8.0
-        g_rf_O_size_mod8 = rf_O_size % 8.0
-
-        return [
-            g_sram_size_mod8,
-            g_d2_sram_size_mod8,
-            g_d1_sram_size_mod8,
-            g_rf_I1_size_mod8,
-            g_rf_I2_size_mod8,
-            g_rf_O_size_mod8,
-        ]
 
     def _evaluate(self, x, out, *args, **kwargs):
         """Evaluate population and compute constraints."""
@@ -671,7 +618,7 @@ def optimize_udc_architecture(
     ]
 
     # Save Pareto front
-    save_pareto_results(
+    save_pareto_results_csv(
         ga_dir / "pareto_front.csv",
         pareto_x,
         pareto_f,
@@ -682,7 +629,7 @@ def optimize_udc_architecture(
 
     # Save full history
     if hasattr(res, "history"):
-        save_full_history(
+        save_history_csv(
             ga_dir / "history.csv",
             res.history,
             decision_headers,
@@ -692,131 +639,6 @@ def optimize_udc_architecture(
 
     print(f"[GA] Results saved to {ga_dir}")
     return pareto_x, pareto_f
-
-
-def save_pareto_results(
-    filepath, pareto_x, pareto_f, pareto_g, decision_headers, constraint_headers
-):
-    """Save Pareto front results to CSV."""
-    with open(filepath, "w", newline="", encoding="utf-8") as file:
-        writer = csv.writer(file)
-        writer.writerow(
-            [
-                "pareto_rank",
-                *decision_headers,
-                "latency",
-                "energy",
-                *constraint_headers,
-                "cv",
-                "feasible",
-            ]
-        )
-
-        # Handle single or multiple solutions
-        if pareto_x.ndim == 1:
-            pareto_x = pareto_x.reshape(1, -1)
-            pareto_f = pareto_f.reshape(1, -1) if pareto_f.ndim == 1 else pareto_f
-            if pareto_g is not None:
-                pareto_g = pareto_g.reshape(1, -1) if pareto_g.ndim == 1 else pareto_g
-
-        for i, (ind_x, ind_f) in enumerate(zip(pareto_x, pareto_f, strict=False)):
-            ind_f_flat = ind_f.flatten() if ind_f.ndim > 1 else ind_f
-            latency_value = float(ind_f_flat[0])
-            energy_value = float(ind_f_flat[1])
-
-            # Compute constraint violation
-            if pareto_g is not None:
-                ind_g = pareto_g[i]
-                ind_g_flat = ind_g.flatten() if ind_g.ndim > 1 else ind_g
-                cv = sum(max(0.0, float(g)) for g in ind_g_flat)
-                constraint_values = [float(g) for g in ind_g_flat]
-            else:
-                cv = 0.0
-                constraint_values = [0.0] * len(constraint_headers)
-
-            feasible = int(cv <= 1e-6)
-
-            writer.writerow(
-                [
-                    i,
-                    *ind_x.tolist(),
-                    latency_value,
-                    energy_value,
-                    *constraint_values,
-                    cv,
-                    feasible,
-                ]
-            )
-
-    print(f"[GA] Saved Pareto front to {filepath}")
-
-
-def save_full_history(
-    filepath, history, decision_headers, constraint_headers, decoder=None
-):
-    """Save full GA history to CSV."""
-    with open(filepath, "w", newline="", encoding="utf-8") as file:
-        writer = csv.writer(file)
-        writer.writerow(
-            [
-                "generation",
-                "individual",
-                *decision_headers,
-                "latency",
-                "energy",
-                *constraint_headers,
-                "cv",
-                "feasible",
-            ]
-        )
-
-        for gen_idx, run in enumerate(history):
-            pop = run.pop
-            for ind_idx, individual in enumerate(pop):
-                decoded_x = (
-                    decoder(individual.X) if decoder is not None else individual.X
-                )
-                ind_x = np.asarray(decoded_x).tolist()
-                ind_f_raw = individual.F
-                ind_g_raw = individual.G if hasattr(individual, "G") else None
-
-                ind_f_flat = (
-                    ind_f_raw.flatten()
-                    if getattr(ind_f_raw, "ndim", 1) > 1
-                    else ind_f_raw
-                )
-
-                latency_value = float(ind_f_flat[0])
-                energy_value = float(ind_f_flat[1])
-
-                if ind_g_raw is not None:
-                    ind_g_flat = (
-                        ind_g_raw.flatten()
-                        if getattr(ind_g_raw, "ndim", 1) > 1
-                        else ind_g_raw
-                    )
-                    cv = sum(max(0.0, float(g)) for g in ind_g_flat)
-                    constraint_values = [float(g) for g in ind_g_flat]
-                else:
-                    cv = 0.0
-                    constraint_values = [0.0] * len(constraint_headers)
-
-                feasible = int(cv <= 1e-6)
-
-                writer.writerow(
-                    [
-                        gen_idx,
-                        ind_idx,
-                        *ind_x,
-                        latency_value,
-                        energy_value,
-                        *constraint_values,
-                        cv,
-                        feasible,
-                    ]
-                )
-
-    print(f"[GA] Saved full history to {filepath}")
 
 
 def parse_args():
