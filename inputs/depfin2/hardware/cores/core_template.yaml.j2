@@ -1,0 +1,136 @@
+name: depfin2_core
+type: compute
+
+memories:
+  rf_1B_I:
+    size: {{ rf_1b_i_size }}
+    auto_cost_extraction: true
+    mem_type: rf
+    latency: 1
+    operands: [I1]
+    served_dimensions: []
+    ports:
+      - name: r_port_1
+        type: read
+        bandwidth_min: {{ rf_1b_i_bw }}
+        bandwidth_max: {{ rf_1b_i_bw }}
+        allocation:
+          - I1, tl
+      - name: w_port_1
+        type: write
+        bandwidth_min: {{ rf_1b_i_bw }}
+        bandwidth_max: {{ rf_1b_i_bw }}
+        allocation:
+          - I1, fh
+
+  rf_1B_W:
+    size: {{ rf_1b_w_size }}
+    auto_cost_extraction: true
+    mem_type: rf
+    latency: 1
+    operands: [I2]
+    served_dimensions: []
+    ports:
+      - name: r_port_1
+        type: read
+        bandwidth_min: {{ rf_1b_w_bw }}
+        bandwidth_max: {{ rf_1b_w_bw }}
+        allocation:
+          - I2, tl
+      - name: w_port_1
+        type: write
+        bandwidth_min: {{ rf_1b_w_bw }}
+        bandwidth_max: {{ rf_1b_w_bw }}
+        allocation:
+          - I2, fh
+
+  rf_4B:
+    size: {{ rf_4b_size }}
+    auto_cost_extraction: true
+    mem_type: rf
+    latency: 1
+    operands: [O]
+    served_dimensions: []
+    ports:
+      - name: r_port_1
+        type: read
+        bandwidth_min: {{ rf_4b_bw }}
+        bandwidth_max: {{ rf_4b_bw }}
+        allocation:
+          - O, tl
+      - name: r_port_2
+        type: read
+        bandwidth_min: {{ rf_4b_bw }}
+        bandwidth_max: {{ rf_4b_bw }}
+        allocation:
+          - O, th
+      - name: w_port_1
+        type: write
+        bandwidth_min: {{ rf_4b_bw }}
+        bandwidth_max: {{ rf_4b_bw }}
+        allocation:
+          - O, fh
+      - name: w_port_2
+        type: write
+        bandwidth_min: {{ rf_4b_bw }}
+        bandwidth_max: {{ rf_4b_bw }}
+        allocation:
+          - O, fl
+
+  l1_w:
+    size: {{ l1_w_size }}
+    auto_cost_extraction: true
+    mem_type: sram
+    latency: 1
+    operands: [I2]
+    served_dimensions: [D1, D2]
+    ports:
+      - name: r_port_1
+        type: read
+        bandwidth_min: {{ l1_w_bw }}
+        bandwidth_max: {{ l1_w_bw }}
+        allocation:
+          - I2, tl
+      - name: w_port_1
+        type: write
+        bandwidth_min: {{ l1_w_bw }}
+        bandwidth_max: {{ l1_w_bw }}
+        allocation:
+          - I2, fh
+
+  l1_act:
+    size: {{ l1_act_size }}
+    auto_cost_extraction: true
+    mem_type: sram
+    latency: 1
+    operands: [I1, O]
+    served_dimensions: [D1, D2]
+    ports:
+      - name: rw_port_1
+        type: read_write
+        bandwidth_min: {{ l1_act_bw_min }}
+        bandwidth_max: {{ l1_act_bw_max }}
+        allocation:
+          - I1, fh
+          - I1, tl
+          - O, fh
+          - O, tl
+      - name: rw_port_2
+        type: read_write
+        bandwidth_min: {{ l1_act_bw_min }}
+        bandwidth_max: {{ l1_act_bw_max }}
+        allocation:
+          - O, fl
+          - O, th
+
+operational_array:
+  unit_energy: 0.04
+  unit_area: 0.00030
+  dimensions: [D1, D2]
+  sizes: [{{ d1_size }}, {{ d2_size }}]
+
+dataflows:
+  D1:
+    - OX, {{ d1_size }}
+  D2:
+    - K, {{ d2_size }}

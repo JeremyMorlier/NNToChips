@@ -1,0 +1,23 @@
+# Single Core Depfin Soc
+name: tpu_like_quad_core
+
+cores:
+  0: ./cores/depfin_cores.yaml   # c
+  1: ./cores/activation_mem.yaml    # activation memory
+  2: ./cores/weight_mem.yaml    # weight memory
+  3: ./cores/offchip.yaml    # DRAM controller
+
+offchip_core_id: 3    # core that fronts external memory
+unit_energy_cost: 0    # default energy for core_connectivity
+
+core_connectivity:
+  # ───── Shared bus to off-chip memory (all cores ↔ DRAM) ─────
+  - type: link
+    cores: [0, 1]
+    bandwidth: 4096
+  - type: link
+    cores: [0, 2]
+    bandwidth: 4096
+  - type: bus
+    cores: [0, 1, 2, 3]
+    bandwidth: 64        # wider than on-chip point-to-point links

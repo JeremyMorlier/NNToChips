@@ -1,0 +1,105 @@
+name: depfin_core
+type: compute
+memories:
+  rf :
+    size: 320 # 32b * 10 words = 320b
+    r_cost: 0.021
+    w_cost: 0.021
+    area: 0
+    latency: 1
+    operands: [I1, I2, O]
+    served_dimensions: []
+    ports:
+      - name: r_port_1
+        type: read
+        bandwidth_min: 8
+        bandwidth_max: 32
+        allocation:
+          - I1, tl
+          - I2, tl
+          - O, tl
+      - name: r_port_2
+        type: read
+        bandwidth_min: 8
+        bandwidth_max: 32
+        allocation:
+          - O, th
+      - name: w_port_1
+        type: write
+        bandwidth_min: 8
+        bandwidth_max: 32
+        allocation:
+          - I1, fh
+          - I2, fh
+          - O, fh
+      - name: w_port_2
+        type: write
+        bandwidth_min: 8
+        bandwidth_max: 32
+        allocation:
+          - O, fl
+  weight_sram:
+    size: 4194304 # 0.5MB of weights
+    r_cost: 0.01
+    w_cost: 0.01
+    area: 0
+    latency: 1
+    operands: [I2]
+    served_dimensions: [D1, D2]
+    ports:
+      - name: r_port_1
+        type: read
+        bandwidth_min: 32
+        bandwidth_max: 4096
+        allocation:
+          - I2, tl
+      - name: w_port_1
+        type: write
+        bandwidth_min: 32
+        bandwidth_max: 4096
+        allocation:
+          - I2, fh
+  activation_sram:
+    size: 8388608 # 1MB of weights
+    r_cost: 0.01
+    w_cost: 0.01
+    area: 0
+    latency: 1
+    operands: [I1, O]
+    served_dimensions: [D1, D2]
+    ports:
+      - name: r_port_1
+        type: read
+        bandwidth_min: 32
+        bandwidth_max: 4096
+        allocation:
+          - I1, tl
+          - O, tl
+      - name: r_port_2
+        type: read
+        bandwidth_min: 32
+        bandwidth_max: 4096
+        allocation:
+          - O, th
+      - name: w_port_1
+        type: write
+        bandwidth_min: 32
+        bandwidth_max: 4096
+        allocation:
+          - I1, fh
+          - O, fh
+      - name: w_port_2
+        type: write
+        bandwidth_min: 32
+        bandwidth_max: 4096
+        allocation:
+          - O, fl
+operational_array:
+  unit_energy: 0.04
+  unit_area: 1
+  dimensions:
+  - D1
+  - D2
+  sizes:
+  - 128
+  - 16
