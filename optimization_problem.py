@@ -224,6 +224,11 @@ class StreamOptimizationProblem(Problem):
 		render_template_to_file(self.workload_template_path, workload_out, workload_context)
 		return workload_out
 
+	def _resolve_mapping(self, eval_dir: Path, params: dict[str, float | int]) -> Path:
+		_ = eval_dir
+		_ = params
+		return self.mapping_path
+
 	def _evaluate_single(self, task: tuple[str, np.ndarray]):
 		eval_id, x_np = task
 		x = [int(v) for v in x_np.tolist()]
@@ -262,12 +267,13 @@ class StreamOptimizationProblem(Problem):
 		try:
 			hardware_soc = self._build_variant_hardware_dir(eval_dir, hardware_context)
 			resolved_workload = self._resolve_workload(eval_dir, workload_context)
+			resolved_mapping = self._resolve_mapping(eval_dir, params)
 
 			rel_path = eval_dir.relative_to(self.output_root)
 			scme = optimize_allocation_co(
 				hardware=str(hardware_soc),
 				workload=str(resolved_workload),
-				mapping=str(self.mapping_path),
+				mapping=str(resolved_mapping),
 				mode=self.stream_mode,
 				layer_stacks=self.layer_stacks,
 				experiment_id=str(rel_path),

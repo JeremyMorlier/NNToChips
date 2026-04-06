@@ -3,24 +3,23 @@ Universal Dataflow Accelerator Architecture Optimization using Genetic Algorithm
 """
 
 import argparse
+import logging
 import shutil
-from multiprocessing import Pool
 from pathlib import Path
-from uuid import uuid4
+
 import numpy as np
-from torch import nn
 import torch
+from torch import nn
+import yaml
 from pymoo.algorithms.moo.nsga2 import NSGA2
-from pymoo.core.problem import Problem
 from pymoo.operators.crossover.binx import BinomialCrossover
-from pymoo.optimize import minimize
 from pymoo.operators.mutation.pm import PM
 from pymoo.operators.repair.rounding import RoundingRepair
 from pymoo.operators.sampling.rnd import IntegerRandomSampling
+from pymoo.optimize import minimize
 from onnx.shape_inference import infer_shapes_path
-import yaml
 
-from stream.api import optimize_allocation_co
+from optimization_problem import ParameterSpec, StreamOptimizationProblem
 from udc import array_to_hardware
 from utils import render_template_to_file, save_history_csv, save_pareto_results_csv
 
@@ -139,87 +138,7 @@ def render_mapping_from_template(
     )
 
 
-def run_stream_with_udc_hardware(
-    array_desc,
-    workload_path,
-    mapping_template_path,
-    mode,
-    layer_stacks,
-    experiment_id,
-    output_path,
-    linear1_k_tile=4,
-    linear2_k_tile=4,
-    sigmoid_h_tile=4,
-    mul_h_tile=4,
-    offchip_source_path="inputs/test/hardware/cores/offchip.yaml",
-):
-    """
-    Run STREAM optimization with UDC-generated hardware.
-
-    Args:
-        array_desc: Hardware parameters for UDC template
-        workload_path: Path to ONNX workload
-        mapping_template_path: Path to mapping template file
-        mode: STREAM optimization mode
-        layer_stacks: Layer stacking configuration
-        experiment_id: Unique experiment identifier
-        output_path: Output directory path
-        linear1_k_tile: K tile size for linear1
-        linear2_k_tile: K tile size for linear2
-        sigmoid_h_tile: H tile size for sigmoid
-        mul_h_tile: H tile size for mul
-        offchip_source_path: Source path for offchip core YAML
-
-    Returns:
-        Tuple of (scme, latency, energy)
-    """
-    penalty = 1e30
-    try:
-        # Generate hardware configuration from UDC template
-        hardware_dir = f"{output_path}/{experiment_id}/hardware"
-        hardware_core_path = f"{hardware_dir}/cores/udc_core.yaml"
-        generate_hardware_from_udc(array_desc, hardware_core_path, name="udc_core")
-
-        # Generate top-level core that includes UDC + offchip
-        top_hardware_path = generate_top_core_with_offchip(
-            output_hardware_dir=hardware_dir,
-            offchip_source_path=offchip_source_path,
-        )
-
-        # Generate mapping configuration from template
-        mapping_path = f"{output_path}/{experiment_id}/mapping/mapping.yaml"
-        render_mapping_from_template(
-            mapping_template_path,
-            mapping_path,
-            linear1_k_tile=linear1_k_tile,
-            linear1_c_tile="all",
-            linear2_k_tile=linear2_k_tile,
-            linear2_c_tile="all",
-            sigmoid_h_tile=sigmoid_h_tile,
-            mul_h_tile=mul_h_tile,
-        )
-
-        # Run STREAM optimization
-        scme = optimize_allocation_co(
-            hardware=top_hardware_path,
-            workload=workload_path,
-            mapping=mapping_path,
-            mode=mode,
-            layer_stacks=layer_stacks,
-            experiment_id=experiment_id,
-            output_path=output_path,
-            skip_if_exists=False,
-        )
-
-        print(f"{experiment_id}: latency={scme.latency}, energy={scme.energy}")
-        return scme, scme.latency, scme.energy
-
-    except Exception as e:
-        print(f"[run_stream_with_udc_hardware] Failed for {experiment_id}: {e}")
-        return None, penalty, penalty
-
-
-class UDCArchitectureOptimizationProblem(Problem):
+class UDCArchitectureOptimizationProblem(StreamOptimizationProblem):
     """
     Pymoo Problem definition for UDC architecture optimization.
 
@@ -263,77 +182,56 @@ class UDCArchitectureOptimizationProblem(Problem):
         mode,
         layer_stacks,
         processes,
+        offchip_source_path="inputs/test/hardware/cores/offchip.yaml",
     ):
-        # Define bounds for each variable
-        xl = np.array(
-            [
-                1,  # d1_min
-                1,  # d2_min
-                65536,  # sram_size_min (64KB)
-                1,  # sram_min_b_min
-                0,  # sram_max_b_selector_min
-                4096,  # d2_sram_size_min (4KB)
-                1,  # d2_sram_min_b_min
-                0,  # d2_sram_max_b_selector_min
-                4096,  # d1_sram_size_min (4KB)
-                1,  # d1_sram_min_b_min
-                0,  # d1_sram_max_b_selector_min
-                8,  # rf_I1_size_min
-                1,  # rf_I1_bw_min
-                8,  # rf_I2_size_min
-                1,  # rf_I2_bw_min
-                8,  # rf_O_size_min
-                1,  # rf_O_bw_min
-                1,  # linear1_k_tile_min
-                1,  # linear2_k_tile_min
-                1,  # sigmoid_h_tile_min
-                1,  # mul_h_tile_min
-            ]
-        )
-
-        xu = np.array(
-            [
-                16,  # d1_max
-                16,  # d2_max
-                67108864,  # sram_size_max (64MB)
-                512,  # sram_min_b_max
-                511,  # sram_max_b_selector_max
-                1048576,  # d2_sram_size_max (1MB)
-                256,  # d2_sram_min_b_max
-                255,  # d2_sram_max_b_selector_max
-                1048576,  # d1_sram_size_max (1MB)
-                256,  # d1_sram_min_b_max
-                255,  # d1_sram_max_b_selector_max
-                256,  # rf_I1_size_max (1/4KB)
-                128,  # rf_I1_bw_max
-                256,  # rf_I2_size_max (1/4KB)
-                128,  # rf_I2_bw_max
-                256,  # rf_O_size_max (1/4KB)
-                128,  # rf_O_bw_max
-                128,  # linear1_k_tile_max
-                128,  # linear2_k_tile_max
-                128,  # sigmoid_h_tile_max
-                128,  # mul_h_tile_max
-            ]
-        )
+        self.mapping_template_path = mapping_template_path
+        self.offchip_source_path = offchip_source_path
 
         super().__init__(
-            n_var=21,
-            n_obj=2,  # latency and energy
-            n_ieq_constr=6,  # memory-alignment constraints
-            xl=xl,
-            xu=xu,
-            vtype=int,
-            elementwise_evaluation=False,
+            parameter_specs=self._parameter_specs(),
+            hardware_template_path=mapping_template_path,
+            base_hardware_dir=output_path,
+            mapping_path=mapping_template_path,
+            workload_path=workload_path,
+            constraint_fn=self._constraint_fn,
+            n_link_constraints=6,
+            layer_stacks=layer_stacks,
+            experiment_id=base_experiment_id,
+            stream_mode=mode,
+            output_root=output_path,
+            n_objectives=2,
+            objective_extractor=self._objective_extractor,
+            penalty_factory=lambda n: [1e30] * n,
+            hardware_context_enricher=self._hardware_context_enricher,
+            normalize_objectives=False,
+            n_processes=processes,
         )
 
-        self.workload_path = workload_path
-        self.mapping_template_path = mapping_template_path
-        self.base_experiment_id = base_experiment_id
-        self.output_path = output_path
-        self.mode = mode
-        self.layer_stacks = layer_stacks
-        self.processes = processes
+    @staticmethod
+    def _parameter_specs() -> list[ParameterSpec]:
+        return [
+            ParameterSpec(name="d1", lower=1, upper=16),
+            ParameterSpec(name="d2", lower=1, upper=16),
+            ParameterSpec(name="sram_size", lower=65536, upper=67108864),
+            ParameterSpec(name="sram_min_b", lower=1, upper=512),
+            ParameterSpec(name="sram_max_b_selector", lower=0, upper=511),
+            ParameterSpec(name="d2_sram_size", lower=4096, upper=1048576),
+            ParameterSpec(name="d2_sram_min_b", lower=1, upper=256),
+            ParameterSpec(name="d2_sram_max_b_selector", lower=0, upper=255),
+            ParameterSpec(name="d1_sram_size", lower=4096, upper=1048576),
+            ParameterSpec(name="d1_sram_min_b", lower=1, upper=256),
+            ParameterSpec(name="d1_sram_max_b_selector", lower=0, upper=255),
+            ParameterSpec(name="rf_I1_size", lower=8, upper=256),
+            ParameterSpec(name="rf_I1_bw", lower=1, upper=128),
+            ParameterSpec(name="rf_I2_size", lower=8, upper=256),
+            ParameterSpec(name="rf_I2_bw", lower=1, upper=128),
+            ParameterSpec(name="rf_O_size", lower=8, upper=256),
+            ParameterSpec(name="rf_O_bw", lower=1, upper=128),
+            ParameterSpec(name="linear1_k_tile", lower=1, upper=128),
+            ParameterSpec(name="linear2_k_tile", lower=1, upper=128),
+            ParameterSpec(name="sigmoid_h_tile", lower=1, upper=128),
+            ParameterSpec(name="mul_h_tile", lower=1, upper=128),
+        ]
 
     @staticmethod
     def _decode_max_bandwidth(min_bw, selector, absolute_upper):
@@ -344,6 +242,99 @@ class UDCArchitectureOptimizationProblem(Problem):
         remaining_bw = np.maximum(0.0, absolute_upper - min_bw_arr)
         scaled_gap = np.rint((selector_arr / selector_upper) * remaining_bw)
         return min_bw_arr + scaled_gap
+
+    def _hardware_context_enricher(self, params: dict[str, float | int]) -> dict[str, object]:
+        sram_max_b = int(
+            self._decode_max_bandwidth(
+                params["sram_min_b"], params["sram_max_b_selector"], self.SRAM_MAX_BW
+            )
+        )
+        d2_sram_max_b = int(
+            self._decode_max_bandwidth(
+                params["d2_sram_min_b"],
+                params["d2_sram_max_b_selector"],
+                self.LOCAL_SRAM_MAX_BW,
+            )
+        )
+        d1_sram_max_b = int(
+            self._decode_max_bandwidth(
+                params["d1_sram_min_b"],
+                params["d1_sram_max_b_selector"],
+                self.LOCAL_SRAM_MAX_BW,
+            )
+        )
+
+        array_desc = [
+            int(params["d1"]),
+            int(params["d2"]),
+            int(params["sram_size"]),
+            int(params["sram_min_b"]),
+            sram_max_b,
+            int(params["d2_sram_size"]),
+            int(params["d2_sram_min_b"]),
+            d2_sram_max_b,
+            int(params["d1_sram_size"]),
+            int(params["d1_sram_min_b"]),
+            d1_sram_max_b,
+            int(params["rf_I1_size"]),
+            int(params["rf_I1_bw"]),
+            int(params["rf_I2_size"]),
+            int(params["rf_I2_bw"]),
+            int(params["rf_O_size"]),
+            int(params["rf_O_bw"]),
+        ]
+
+        return {
+            "sram_max_b": sram_max_b,
+            "d2_sram_max_b": d2_sram_max_b,
+            "d1_sram_max_b": d1_sram_max_b,
+            "array_desc": array_desc,
+        }
+
+    @staticmethod
+    def _constraint_fn(params: dict[str, float | int]) -> list[float]:
+        return [
+            float(int(params["sram_size"]) % 8),
+            float(int(params["d2_sram_size"]) % 8),
+            float(int(params["d1_sram_size"]) % 8),
+            float(int(params["rf_I1_size"]) % 8),
+            float(int(params["rf_I2_size"]) % 8),
+            float(int(params["rf_O_size"]) % 8),
+        ]
+
+    @staticmethod
+    def _objective_extractor(scme: object) -> list[float]:
+        return [float(scme.latency), float(scme.energy)]
+
+    def _build_variant_hardware_dir(
+        self, eval_dir: Path, hardware_context: dict[str, object]
+    ) -> Path:
+        hardware_dir = eval_dir / "hardware"
+        hardware_core_path = hardware_dir / "cores" / "udc_core.yaml"
+        generate_hardware_from_udc(
+            hardware_context["array_desc"],
+            hardware_core_path,
+            name="udc_core",
+        )
+        top_hardware_path = generate_top_core_with_offchip(
+            output_hardware_dir=hardware_dir,
+            offchip_source_path=self.offchip_source_path,
+        )
+        return Path(top_hardware_path)
+
+    def _resolve_mapping(self, eval_dir: Path, params: dict[str, float | int]) -> Path:
+        mapping_path = eval_dir / "mapping" / "mapping.yaml"
+        render_mapping_from_template(
+            self.mapping_template_path,
+            mapping_path,
+            linear1_k_tile=int(params["linear1_k_tile"]),
+            linear1_c_tile="all",
+            linear2_k_tile=int(params["linear2_k_tile"]),
+            linear2_c_tile="all",
+            sigmoid_h_tile=int(params["sigmoid_h_tile"]),
+            mul_h_tile=int(params["mul_h_tile"]),
+        )
+        return mapping_path
 
     def decode_design_variables(self, x):
         """Decode encoded decision variables into actual hardware parameters."""
@@ -372,134 +363,20 @@ class UDCArchitectureOptimizationProblem(Problem):
         )
         return decoded
 
-    def single_stream_eval(self, x):
-        """Evaluate a single architecture configuration."""
-        penalty = 1e30
-        decoded_x = self.decode_design_variables(x)
-
-        # First 17 variables are hardware parameters
-        array_desc = [int(v) for v in decoded_x[:17]]
-
-        # Last 4 variables are tiling parameters
-        linear1_k_tile = int(decoded_x[17])
-        linear2_k_tile = int(decoded_x[18])
-        sigmoid_h_tile = int(decoded_x[19])
-        mul_h_tile = int(decoded_x[20])
-
-        experiment_id = f"{self.base_experiment_id}_ga_eval_{uuid4().hex[:8]}"
-
-        try:
-            _, latency, energy = run_stream_with_udc_hardware(
-                array_desc=array_desc,
-                workload_path=self.workload_path,
-                mapping_template_path=self.mapping_template_path,
-                mode=self.mode,
-                layer_stacks=self.layer_stacks,
-                experiment_id=experiment_id,
-                output_path=self.output_path,
-                linear1_k_tile=linear1_k_tile,
-                linear2_k_tile=linear2_k_tile,
-                sigmoid_h_tile=sigmoid_h_tile,
-                mul_h_tile=mul_h_tile,
+    def _evaluate_single(self, task):
+        result = super()._evaluate_single(task)
+        eval_id, _ = task
+        f, _, _, _, evaluation_failed = result
+        if evaluation_failed:
+            logging.warning("%s: STREAM evaluation failed, applying penalty.", eval_id)
+        else:
+            logging.info(
+                "%s: latency=%.0f cycles, energy=%.2f pJ",
+                eval_id,
+                f[0],
+                f[1],
             )
-            objective = float(latency), float(energy)
-        except Exception as e:
-            print(f"[single_stream_eval] Exception: {e}")
-            objective = penalty, penalty
-
-        return objective
-
-    def _evaluate(self, x, out, *args, **kwargs):
-        """Evaluate population and compute constraints."""
-        decoded_x = self.decode_design_variables(x)
-
-        # Extract variables for constraint computation
-        sram_size = decoded_x[:, 2].astype(np.float64)
-        d2_sram_size = decoded_x[:, 5].astype(np.float64)
-        d1_sram_size = decoded_x[:, 8].astype(np.float64)
-        rf_I1_size = decoded_x[:, 11].astype(np.float64)
-        rf_I2_size = decoded_x[:, 13].astype(np.float64)
-        rf_O_size = decoded_x[:, 15].astype(np.float64)
-
-        # ============================================================
-        # CONSTRAINT DEFINITIONS (G <= 0)
-        # ============================================================
-
-        # Example optional constraints kept here for future extension:
-        # compute = d1 * d2
-        # g_compute = compute - 131072.0  # 128K MACs
-
-        # total_memory = (
-        #     sram_size
-        #     + d2_sram_size
-        #     + d1_sram_size
-        #     + rf_I1_size * d1 * d2
-        #     + rf_I2_size * d1 * d2
-        #     + rf_O_size * d1
-        # )
-        # g_memory = total_memory - (8 * 1024 * 1024 * 8)  # 8MB in bits
-
-        # sram_bitcell_area_um2 = 0.022
-        # mac_area_um2 = 400.0
-        # total_area_um2 = compute * mac_area_um2 + total_memory * sram_bitcell_area_um2
-        # area_budget_um2 = 500_000.0  # 0.5 mm^2
-        # g_area = total_area_um2 - area_budget_um2
-
-        # Memory alignment constraints: every memory size must be a multiple of 8
-        # For integer variables, remainder is >= 0. Enforcing remainder <= 0 forces remainder == 0.
-        g_sram_size_mod8 = np.mod(sram_size, 8.0)
-        g_d2_sram_size_mod8 = np.mod(d2_sram_size, 8.0)
-        g_d1_sram_size_mod8 = np.mod(d1_sram_size, 8.0)
-        g_rf_I1_size_mod8 = np.mod(rf_I1_size, 8.0)
-        g_rf_I2_size_mod8 = np.mod(rf_I2_size, 8.0)
-        g_rf_O_size_mod8 = np.mod(rf_O_size, 8.0)
-
-        # Build constraint matrix first to identify feasible candidates.
-        g_matrix = np.column_stack(
-            [
-                g_sram_size_mod8,
-                g_d2_sram_size_mod8,
-                g_d1_sram_size_mod8,
-                g_rf_I1_size_mod8,
-                g_rf_I2_size_mod8,
-                g_rf_O_size_mod8,
-            ]
-        )
-
-        # Evaluate only feasible candidates (G <= 0) and penalize the rest.
-        penalty = 1e30
-        feasible_mask = np.all(g_matrix <= 0.0, axis=1)
-        f_matrix = np.full((x.shape[0], 2), penalty, dtype=np.float64)
-
-        feasible_indices = np.where(feasible_mask)[0]
-        if feasible_indices.size > 0:
-            feasible_individuals = [x[i] for i in feasible_indices]
-            with Pool(processes=self.processes) as pool:
-                feasible_results = pool.map(
-                    self.single_stream_eval, feasible_individuals
-                )
-            f_matrix[feasible_indices] = np.asarray(feasible_results, dtype=np.float64)
-
-        out["F"] = f_matrix
-
-        # ============================================================
-        # SPACE FOR ADDITIONAL CONSTRAINTS
-        # ============================================================
-        # Add your custom constraints here following the pattern:
-        # g_custom = expression - threshold
-        # where the constraint is: expression <= threshold
-
-        # Example: Ensure RF sizes are proportional to array dimensions
-        # g_rf_proportion = (rf_I1_size + rf_I2_size) - (d1 * d2 * 16)
-
-        # Example: Bandwidth utilization constraint
-        # min_bw_utilization = 0.5
-        # g_bw_util = min_bw_utilization - (sram_min_b / sram_max_b)
-
-        # ============================================================
-
-        # Stack all constraints
-        out["G"] = g_matrix
+        return result
 
 
 def optimize_udc_architecture(
@@ -572,13 +449,13 @@ def optimize_udc_architecture(
 
     pareto_x = problem.decode_design_variables(pareto_x)
 
-    print("\n" + "=" * 80)
-    print("PARETO FRONT SUMMARY")
-    print("=" * 80)
-    print(f"Number of solutions: {pareto_x.shape[0]}")
-    print(f"Decision variables shape: {pareto_x.shape}")
-    print(f"Objectives shape: {pareto_f.shape}")
-    print("=" * 80 + "\n")
+    logging.info("=" * 80)
+    logging.info("PARETO FRONT SUMMARY")
+    logging.info("=" * 80)
+    logging.info("Number of solutions: %s", pareto_x.shape[0])
+    logging.info("Decision variables shape: %s", pareto_x.shape)
+    logging.info("Objectives shape: %s", pareto_f.shape)
+    logging.info("=" * 80)
 
     # Save results
     ga_dir = Path(output_path) / experiment_id / "ga"
@@ -637,7 +514,7 @@ def optimize_udc_architecture(
             decoder=problem.decode_design_variables,
         )
 
-    print(f"[GA] Results saved to {ga_dir}")
+    logging.info("[GA] Results saved to %s", ga_dir)
     return pareto_x, pareto_f
 
 
@@ -692,6 +569,8 @@ def main():
     """Main execution function."""
     args = parse_args()
 
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
     # Create MLP model and export to ONNX
     dim = args.dim
     hidden_dim = dim * args.hidden_dim_factor
@@ -700,7 +579,11 @@ def main():
     onnx_path = f"{args.output_path}/{args.experiment_id}/model.onnx"
     Path(onnx_path).parent.mkdir(parents=True, exist_ok=True)
 
-    print(f"Exporting MLP model (dim={dim}, hidden_dim={hidden_dim}) to ONNX...")
+    logging.info(
+        "Exporting MLP model (dim=%s, hidden_dim=%s) to ONNX...",
+        dim,
+        hidden_dim,
+    )
     dummy_input = torch.randn(1, dim)
     torch.onnx.export(
         model,
@@ -712,20 +595,20 @@ def main():
 
     # Infer shapes
     infer_shapes_path(onnx_path, onnx_path)
-    print(f"ONNX model saved to {onnx_path}")
+    logging.info("ONNX model saved to %s", onnx_path)
 
     # Define layer stacks for fused mode
     layer_stacks = [(0, 1), (2,), (3,)]
 
     # Run GA optimization
-    print("\n" + "=" * 80)
-    print("STARTING GENETIC ALGORITHM OPTIMIZATION")
-    print("=" * 80)
-    print(f"Generations: {args.n_gen}")
-    print(f"Population size: {args.pop_size}")
-    print(f"Parallel jobs: {args.n_jobs}")
-    print(f"Mode: {args.mode}")
-    print("=" * 80 + "\n")
+    logging.info("=" * 80)
+    logging.info("STARTING GENETIC ALGORITHM OPTIMIZATION")
+    logging.info("=" * 80)
+    logging.info("Generations: %s", args.n_gen)
+    logging.info("Population size: %s", args.pop_size)
+    logging.info("Parallel jobs: %s", args.n_jobs)
+    logging.info("Mode: %s", args.mode)
+    logging.info("=" * 80)
 
     best_x, best_f = optimize_udc_architecture(
         workload_path=onnx_path,
@@ -740,11 +623,11 @@ def main():
         n_jobs=args.n_jobs,
     )
 
-    print("\n" + "=" * 80)
-    print("OPTIMIZATION COMPLETE")
-    print("=" * 80)
-    print(f"Results saved to: {args.output_path}/{args.experiment_id}/ga/")
-    print("=" * 80 + "\n")
+    logging.info("=" * 80)
+    logging.info("OPTIMIZATION COMPLETE")
+    logging.info("=" * 80)
+    logging.info("Results saved to: %s/%s/ga/", args.output_path, args.experiment_id)
+    logging.info("=" * 80)
 
 
 if __name__ == "__main__":
