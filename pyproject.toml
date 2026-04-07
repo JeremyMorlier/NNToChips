@@ -17,6 +17,7 @@ dependencies = [
     "torchinfo>=1.8.0",
     "zigzag-dse",
     "ipykernel>=7.2.0",
+    "pytest>=9.0.3",
 ]
 
 [tool.uv.workspace]
