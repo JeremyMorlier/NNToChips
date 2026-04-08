@@ -8,6 +8,7 @@ from stages.accelerator_template_parser import AcceleratorTemplateParserStage
 
 DEPFIN2_DIR = Path(__file__).parent.parent / "inputs" / "depfin2"
 DEPFIN2_SOC_PATH = DEPFIN2_DIR / "hardware" / "soc.yaml"
+DEPFIN2_CORE_TEMPLATE_PATH = DEPFIN2_DIR / "hardware" / "cores" / "core_template.j2"
 DEPFIN2_WORKLOAD_PATH = DEPFIN2_DIR / "workload" / "fsrcnn.onnx"
 DEPFIN2_MAPPING_PATH = DEPFIN2_DIR / "mapping" / "mapping.yaml"
 
@@ -81,12 +82,29 @@ def test_optimize_single_hardware_co_full_with_genetic_stage():
             skip_if_exists=False,
             # Keep GA tiny to make integration test runtime practical.
             hardware_ga_parameter_specs=[
-                {"name": "bus_bw", "lower": 32, "upper": 64, "scale": 1},
+                {"name": "d1_size", "lower": 64, "upper": 128, "scale": 1},
             ],
+            hardware_ga_core_template=str(DEPFIN2_CORE_TEMPLATE_PATH),
+            hardware_ga_core_template_params={
+                "rf_1b_i_size": 8,
+                "rf_1b_i_bw": 8,
+                "rf_1b_w_size": 8,
+                "rf_1b_w_bw": 8,
+                "rf_4b_size": 16,
+                "rf_4b_bw": 16,
+                "l1_w_size": 4_194_304,
+                "l1_w_bw": 128,
+                "l1_act_size": 8_388_608,
+                "l1_act_bw_min": 64,
+                "l1_act_bw_max": 1024,
+                "d1_size": 128,
+                "d2_size": 16,
+            },
+            hardware_ga_target_core_id=0,
             hardware_ga_generations=1,
             hardware_ga_population=2,
             hardware_ga_seed=0,
-            template_params={"bus_bw": 64},
+            template_params={},
         )
 
     assert result is not None

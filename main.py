@@ -66,9 +66,13 @@ def optimize_single_hardware_co(  # noqa: PLR0913
     temporal_mapping_type: str = "uneven",
     template_params: dict | None = None,
     hardware_ga_parameter_specs: list[dict] | None = None,
+    hardware_ga_core_template: str | None = None,
+    hardware_ga_core_template_params: dict | None = None,
+    hardware_ga_target_core_id: int = 0,
     hardware_ga_generations: int = 3,
     hardware_ga_population: int = 8,
     hardware_ga_seed: int = 42,
+    hardware_ga_workers: int | None = None,
 ) -> StreamCostModelEvaluation:
     _sanity_check_inputs(hardware_template, workload, mode, output_path)
     _sanity_check_gurobi_license()
@@ -125,9 +129,13 @@ def optimize_single_hardware_co(  # noqa: PLR0913
             operands_to_prefetch=[],
             template_params=template_params or {},
             hardware_ga_parameter_specs=hardware_ga_parameter_specs or [],
+            hardware_ga_core_template=hardware_ga_core_template,
+            hardware_ga_core_template_params=hardware_ga_core_template_params or {},
+            hardware_ga_target_core_id=hardware_ga_target_core_id,
             hardware_ga_generations=hardware_ga_generations,
             hardware_ga_population=hardware_ga_population,
             hardware_ga_seed=hardware_ga_seed,
+            hardware_ga_workers=hardware_ga_workers,
         )
         # Launch the MainStage
         answers = mainstage.run()

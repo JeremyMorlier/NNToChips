@@ -118,6 +118,7 @@ def test_run_ga_mode_forwards_best_params(monkeypatch):
         accelerator=original_accelerator,
         workload=workload,
         hardware_template="/tmp/fake_template.yaml",
+        hardware_ga_core_template="/tmp/fake_core_template.yaml",
         hardware_ga_parameter_specs=[{"name": "d1_size", "lower": 1, "upper": 4}],
         hardware_ga_population=4,
         hardware_ga_generations=2,
@@ -130,7 +131,7 @@ def test_run_ga_mode_forwards_best_params(monkeypatch):
         return SimpleNamespace()
 
     monkeypatch.setattr("stages.genetichardware.minimize", fake_minimize)
-    monkeypatch.setattr(stage, "_build_accelerator_from_template", lambda params: best_accelerator)
+    monkeypatch.setattr(stage, "_build_accelerator_from_templates", lambda params: best_accelerator)
 
     results = list(stage.run())
 

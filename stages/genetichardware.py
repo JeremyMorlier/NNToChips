@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import multiprocessing as mp
 import os
+import shutil
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -98,14 +99,17 @@ class GeneticHardwareStage(Stage):
 	"""Optimize template parameters with NSGA-II and pass best candidate to downstream stages.
 
 	Expected kwargs:
-	- hardware_template: path to a Jinja2 yaml accelerator template.
+	- hardware_template: path to a SoC yaml template.
+	- hardware_ga_core_template: path to a core yaml template to optimize.
 	- hardware_ga_parameter_specs: list of dicts with keys {name, lower, upper, scale?}.
 
 	Optional kwargs:
 	- hardware_ga_generations (default 3)
 	- hardware_ga_population (default 8)
 	- hardware_ga_seed (default 42)
-	- template_params (base template context dict, merged with candidate params)
+	- template_params (base SoC template context dict)
+	- hardware_ga_core_template_params (base core template context dict, merged with candidate params)
+	- hardware_ga_target_core_id (default 0)
 	"""
 
 	def __init__(self, list_of_callables: list[StageCallable], **kwargs: Any):
@@ -113,13 +117,21 @@ class GeneticHardwareStage(Stage):
 		self.accelerator: Accelerator = kwargs["accelerator"]
 		self.workload = kwargs["workload"]
 		self.hardware_template: str | None = kwargs.get("hardware_template")
+		self.hardware_ga_core_template: str | None = kwargs.get("hardware_ga_core_template")
 		self.template_params: dict[str, Any] = dict(kwargs.get("template_params", {}))
+		self.hardware_ga_core_template_params: dict[str, Any] = dict(
+			kwargs.get("hardware_ga_core_template_params", {})
+		)
+		self.hardware_ga_target_core_id = int(kwargs.get("hardware_ga_target_core_id", 0))
 		self.parameter_specs = self._parse_parameter_specs(kwargs.get("hardware_ga_parameter_specs", []))
 
 		self.ga_generations = int(kwargs.get("hardware_ga_generations", 3))
 		self.ga_population = int(kwargs.get("hardware_ga_population", 8))
 		self.ga_seed = int(kwargs.get("hardware_ga_seed", 42))
-		self.ga_workers = max(1, int(kwargs.get("hardware_ga_workers", os.cpu_count() or 1)))
+		raw_workers = kwargs.get("hardware_ga_workers", os.cpu_count() or 1)
+		if raw_workers is None:
+			raw_workers = os.cpu_count() or 1
+		self.ga_workers = max(1, int(raw_workers))
 		self.ga_weight_energy = float(kwargs.get("hardware_ga_weight_energy", 1.0))
 		self.ga_weight_latency = float(kwargs.get("hardware_ga_weight_latency", 1.0))
 		self.ga_weight_area = float(kwargs.get("hardware_ga_weight_area", 1.0))
@@ -142,8 +154,10 @@ class GeneticHardwareStage(Stage):
 
 	def run(self):
 		# If no GA configuration is provided, keep existing behavior and pass-through.
-		if not self.hardware_template or not self.parameter_specs:
-			logger.info("GeneticHardwareStage disabled (missing template or parameter specs).")
+		if not self.hardware_template or not self.hardware_ga_core_template or not self.parameter_specs:
+			logger.info(
+				"GeneticHardwareStage disabled (missing SoC template, core template, or parameter specs)."
+			)
 			kwargs = self.kwargs.copy()
 			kwargs["accelerator"] = self.accelerator
 			kwargs["workload"] = self.workload
@@ -172,7 +186,7 @@ class GeneticHardwareStage(Stage):
 			raise RuntimeError("Hardware GA did not produce any valid candidate.")
 
 		logger.info("Best hardware parameters from GA: %s", problem.best_params)
-		best_accelerator = self._build_accelerator_from_template(problem.best_params)
+		best_accelerator = self._build_accelerator_from_templates(problem.best_params)
 
 		kwargs = self.kwargs.copy()
 		kwargs["accelerator"] = best_accelerator
@@ -214,7 +228,7 @@ class GeneticHardwareStage(Stage):
 		)
 
 	def _evaluate_candidate(self, params: dict[str, int]):
-		candidate_accelerator = self._build_accelerator_from_template(params)
+		candidate_accelerator = self._build_accelerator_from_templates(params)
 		kwargs = self.kwargs.copy()
 		kwargs["accelerator"] = candidate_accelerator
 		kwargs["workload"] = self.workload
@@ -300,21 +314,81 @@ class GeneticHardwareStage(Stage):
 			else:
 				kwargs[key] = str(root / base_name)
 
-	def _build_accelerator_from_template(self, candidate_params: dict[str, int]) -> Accelerator:
+	@staticmethod
+	def _find_core_key(cores: dict[Any, Any], target_core_id: int) -> Any | None:
+		if target_core_id in cores:
+			return target_core_id
+		target_str = str(target_core_id)
+		if target_str in cores:
+			return target_str
+		for key in cores:
+			try:
+				if int(key) == target_core_id:
+					return key
+			except (TypeError, ValueError):
+				continue
+		return None
+
+	def _build_accelerator_from_templates(self, candidate_params: dict[str, int]) -> Accelerator:
 		assert self.hardware_template is not None
-		context = dict(self.template_params)
-		context.update(candidate_params)
+		assert self.hardware_ga_core_template is not None
 
-		rendered_yaml = self._render_template(self.hardware_template, context)
-		accelerator_data = yaml.safe_load(rendered_yaml)
+		soc_context = dict(self.template_params)
+		rendered_soc_yaml = self._render_template(self.hardware_template, soc_context)
+		soc_data = yaml.safe_load(rendered_soc_yaml)
+		if not isinstance(soc_data, dict):
+			raise ValueError("Rendered SoC template did not produce a YAML mapping.")
 
-		validator = AcceleratorValidator(accelerator_data, self.hardware_template)
-		accelerator_data = validator.normalized_data
-		if not validator.validate():
-			raise ValueError("Failed to validate accelerator generated from hardware template.")
+		cores = soc_data.get("cores")
+		if not isinstance(cores, dict):
+			raise ValueError("Rendered SoC template must contain a 'cores' mapping.")
 
-		factory = AcceleratorFactory(accelerator_data)
-		return factory.create()
+		core_key = self._find_core_key(cores, self.hardware_ga_target_core_id)
+		if core_key is None:
+			raise KeyError(f"Target core id {self.hardware_ga_target_core_id} was not found in SoC cores.")
+
+		core_context = dict(self.hardware_ga_core_template_params)
+		core_context.update(candidate_params)
+		rendered_core_yaml = self._render_template(self.hardware_ga_core_template, core_context)
+
+		soc_template_dir = Path(self.hardware_template).resolve().parent
+
+		with tempfile.TemporaryDirectory(prefix="ga_hw_core_build_") as tmp_dir:
+			tmp_path = Path(tmp_dir)
+			tmp_cores_dir = tmp_path / "cores"
+			tmp_cores_dir.mkdir(parents=True, exist_ok=True)
+
+			normalized_cores: dict[Any, Any] = {}
+			for key, value in cores.items():
+				local_core_name = f"core_{str(key)}.yaml"
+				local_core_path = tmp_cores_dir / local_core_name
+
+				if key == core_key:
+					local_core_path.write_text(rendered_core_yaml, encoding="utf-8")
+					normalized_cores[key] = f"./cores/{local_core_name}"
+					continue
+
+				if isinstance(value, str):
+					source_core_path = Path(value)
+					if not source_core_path.is_absolute():
+						source_core_path = (soc_template_dir / source_core_path).resolve()
+					shutil.copyfile(source_core_path, local_core_path)
+					normalized_cores[key] = f"./cores/{local_core_name}"
+				else:
+					normalized_cores[key] = value
+
+			soc_data["cores"] = normalized_cores
+
+			rendered_soc_path = tmp_path / "soc_rendered.yaml"
+			rendered_soc_path.write_text(yaml.safe_dump(soc_data, sort_keys=False), encoding="utf-8")
+
+			validator = AcceleratorValidator(soc_data, str(rendered_soc_path))
+			accelerator_data = validator.normalized_data
+			if not validator.validate():
+				raise ValueError("Failed to validate accelerator generated from SoC/core templates.")
+
+			factory = AcceleratorFactory(accelerator_data)
+			return factory.create()
 
 	@staticmethod
 	def _render_template(template_path: str, context: dict[str, Any]) -> str:

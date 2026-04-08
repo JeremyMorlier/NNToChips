@@ -105,10 +105,27 @@ def main():
         "bus_bw": 64,
     }
 
-    # Current integration with optimize_single_hardware_co supports hardware GA
-    # over template placeholders present in the top-level accelerator template.
+    core_template_path = depfin2_hw_dir / "cores" / "core_template.j2"
+    core_template_params = {
+        "rf_1b_i_size": 8,
+        "rf_1b_i_bw": 8,
+        "rf_1b_w_size": 8,
+        "rf_1b_w_bw": 8,
+        "rf_4b_size": 16,
+        "rf_4b_bw": 16,
+        "l1_w_size": 4_194_304,
+        "l1_w_bw": 128,
+        "l1_act_size": 8_388_608,
+        "l1_act_bw_min": 64,
+        "l1_act_bw_max": 1024,
+        "d1_size": 128,
+        "d2_size": 16,
+    }
+
+    # Hardware GA optimizes only core-template parameters.
     hardware_ga_parameter_specs = [
-        {"name": "bus_bw", "lower": 32, "upper": 256, "scale": 1},
+        {"name": "d1_size", "lower": 64, "upper": 256, "scale": 1},
+        {"name": "d2_size", "lower": 8, "upper": 32, "scale": 1},
     ]
 
     logging.info("Starting optimize_single_hardware_co test flow")
@@ -122,6 +139,9 @@ def main():
         skip_if_exists=False,
         template_params=template_params,
         hardware_ga_parameter_specs=hardware_ga_parameter_specs,
+        hardware_ga_core_template=str(core_template_path),
+        hardware_ga_core_template_params=core_template_params,
+        hardware_ga_target_core_id=0,
         hardware_ga_generations=args.generations,
         hardware_ga_population=args.pop_size,
         hardware_ga_seed=args.seed,
