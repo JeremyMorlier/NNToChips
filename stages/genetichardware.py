@@ -20,8 +20,10 @@ from pymoo.optimize import minimize
 from stream.hardware.architecture.accelerator import Accelerator
 from stream.parser.accelerator_factory import AcceleratorFactory
 from stream.parser.accelerator_validator import AcceleratorValidator
+from stream.stages.allocation.constraint_optimization_allocation import ConstraintOptimizationAllocationStage
 from stream.stages.stage import Stage, StageCallable
 from stream.utils import get_unique_nodes
+from stream.workload.computation.computation_node import ComputationNode
 
 logger = logging.getLogger(__name__)
 
@@ -123,6 +125,8 @@ class GeneticHardwareStage(Stage):
 			kwargs.get("hardware_ga_core_template_params", {})
 		)
 		self.hardware_ga_target_core_id = int(kwargs.get("hardware_ga_target_core_id", 0))
+		self.hardware_ga_stack_index = kwargs.get("hardware_ga_stack_index")
+		self.layer_stacks: list[tuple[int, ...]] = list(kwargs.get("layer_stacks", []))
 		self.parameter_specs = self._parse_parameter_specs(kwargs.get("hardware_ga_parameter_specs", []))
 
 		self.ga_generations = int(kwargs.get("hardware_ga_generations", 3))
@@ -258,39 +262,121 @@ class GeneticHardwareStage(Stage):
 		if cost_lut is None or workload is None:
 			raise RuntimeError("Missing cost_lut/workload in ZigZag candidate evaluation output.")
 
-		return self._build_proxy_scme_from_cost_lut(cost_lut, workload, accelerator)
+		return self._build_proxy_scme_from_cost_lut(
+			cost_lut=cost_lut,
+			workload=workload,
+			accelerator=accelerator,
+			layer_stacks=self.layer_stacks,
+			target_core_id=self.hardware_ga_target_core_id,
+			stack_index=self.hardware_ga_stack_index,
+		)
 
 	@staticmethod
-	def _build_proxy_scme_from_cost_lut(cost_lut: Any, workload: Any, accelerator: Any) -> Any:
-		"""Aggregate per-node best ZigZag estimates into a proxy SCME-like object."""
+	def _extract_steady_state_nodes_per_stack(
+		workload: Any,
+		layer_stacks: list[tuple[int, ...]],
+	) -> dict[tuple[int, ...], set[ComputationNode]]:
+		if not layer_stacks:
+			return {}
+
+		co_stage = ConstraintOptimizationAllocationStage.__new__(ConstraintOptimizationAllocationStage)
+		co_stage.workload = workload
+		co_stage.layer_stacks = layer_stacks
+		co_stage.ss_to_computes = {}
+		co_stage.hashes_per_sink_node = {}
+		co_stage.steady_state_hashes = {}
+		co_stage.compute_per_sink_node = {}
+		co_stage.ss_iterations_per_stack = {}
+		co_stage.optimal_allocation_per_stack = {}
+		co_stage.nb_macs_per_stack = {}
+		co_stage.nb_macs_in_ss_per_stack = {}
+		co_stage.ss_mac_percentages_per_stack = {}
+
+		co_stage.extract_steady_state_per_stack()
+		return co_stage.ss_to_computes
+
+	@staticmethod
+	def _resolve_assigned_core_id(node: Any) -> int | None:
+		if hasattr(node, "chosen_core_allocation"):
+			chosen = getattr(node, "chosen_core_allocation")
+			if chosen is None:
+				return None
+			if isinstance(chosen, list):
+				if len(chosen) == 1:
+					return int(chosen[0])
+				return None
+			return int(chosen)
+
+		possible = getattr(node, "possible_core_allocation", None)
+		if isinstance(possible, list) and len(possible) == 1:
+			return int(possible[0])
+		return None
+
+	@staticmethod
+	def _build_proxy_scme_from_cost_lut(
+		cost_lut: Any,
+		workload: Any,
+		accelerator: Any,
+		layer_stacks: list[tuple[int, ...]],
+		target_core_id: int,
+		stack_index: int | None,
+	) -> Any:
+		"""Aggregate steady-state CT latency/energy for tiles assigned to target core."""
 		total_energy = 0.0
 		total_latency = 0.0
 
-		for node in get_unique_nodes(workload):
+		ss_nodes_per_stack = GeneticHardwareStage._extract_steady_state_nodes_per_stack(workload, layer_stacks)
+		if ss_nodes_per_stack:
+			candidate_stacks = list(ss_nodes_per_stack.keys())
+			if stack_index is not None:
+				if stack_index < 0 or stack_index >= len(candidate_stacks):
+					raise IndexError(
+						f"hardware_ga_stack_index={stack_index} out of range for {len(candidate_stacks)} stacks."
+					)
+				candidate_stacks = [candidate_stacks[stack_index]]
+
+			nodes_to_score: list[ComputationNode] = []
+			for stack in candidate_stacks:
+				nodes_to_score.extend(sorted(ss_nodes_per_stack.get(stack, set())))
+		else:
+			nodes_to_score = [node for node in get_unique_nodes(workload) if isinstance(node, ComputationNode)]
+
+		for node in nodes_to_score:
+			assigned_core_id = GeneticHardwareStage._resolve_assigned_core_id(node)
+			if assigned_core_id is not None and assigned_core_id != target_core_id:
+				continue
+
 			equal_node = cost_lut.get_equal_node(node) or node
 			cores = cost_lut.get_cores(equal_node)
 			if not cores:
 				raise RuntimeError(f"No ZigZag CME found for node {node}.")
 
-			best_node_energy = float("inf")
-			best_node_latency = float("inf")
+			target_core_energy = float("inf")
+			target_core_latency = float("inf")
+			found_target_core = False
 			for core in cores:
+				core_id = int(getattr(core, "id", -1))
+				if core_id != target_core_id:
+					continue
+
+				found_target_core = True
 				cme = cost_lut.get_cme(equal_node, core)
 				energy = float(getattr(cme, "energy_total", getattr(cme, "energy", 1e30)))
 				latency = float(getattr(cme, "latency_total2", getattr(cme, "latency", 1e30)))
-				best_node_energy = min(best_node_energy, energy)
-				best_node_latency = min(best_node_latency, latency)
+				target_core_energy = min(target_core_energy, energy)
+				target_core_latency = min(target_core_latency, latency)
 
-			total_energy += best_node_energy
-			total_latency += best_node_latency
+			if not found_target_core:
+				continue
+
+			total_energy += target_core_energy
+			total_latency += target_core_latency
 
 		return SimpleNamespace(
 			energy=total_energy,
 			latency=total_latency,
 			accelerator=SimpleNamespace(area=float(getattr(accelerator, "area", 1e30))),
 		)
-
-		return answers[0][0]
 
 	@staticmethod
 	def _override_candidate_paths(kwargs: dict[str, Any], root: Path) -> None:
