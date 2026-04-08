@@ -1,0 +1,339 @@
+from __future__ import annotations
+
+import logging
+import multiprocessing as mp
+import os
+import tempfile
+from dataclasses import dataclass
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
+
+import numpy as np
+import yaml
+from jinja2 import Environment, FileSystemLoader
+from pymoo.algorithms.moo.nsga2 import NSGA2
+from pymoo.core.problem import Problem
+from pymoo.optimize import minimize
+
+from stream.hardware.architecture.accelerator import Accelerator
+from stream.parser.accelerator_factory import AcceleratorFactory
+from stream.parser.accelerator_validator import AcceleratorValidator
+from stream.stages.stage import Stage, StageCallable
+from stream.utils import get_unique_nodes
+
+logger = logging.getLogger(__name__)
+
+
+_MP_EVAL_STAGE = None
+
+
+def _mp_safe_evaluate_candidate(params: dict[str, int]) -> Any | None:
+	global _MP_EVAL_STAGE
+	stage = _MP_EVAL_STAGE
+	if stage is None:
+		return None
+	return stage._safe_evaluate_candidate(params)
+
+
+@dataclass(frozen=True)
+class HardwareGAParameter:
+	"""One hardware-template decision variable for NSGA-II."""
+
+	name: str
+	lower: int
+	upper: int
+	scale: int = 1
+
+
+class _HardwareTemplateProblem(Problem):
+	"""Pymoo problem wrapper that evaluates a template candidate via downstream Stream stages."""
+
+	def __init__(self, stage: "GeneticHardwareStage", parameter_specs: list[HardwareGAParameter]):
+		self.stage = stage
+		self.parameter_specs = parameter_specs
+		self.best_score = float("inf")
+		self.best_params: dict[str, int] | None = None
+		self.best_scme = None
+
+		super().__init__(
+			n_var=len(parameter_specs),
+			n_obj=3,  # energy, latency, area
+			n_constr=0,
+			xl=np.array([spec.lower for spec in parameter_specs], dtype=int),
+			xu=np.array([spec.upper for spec in parameter_specs], dtype=int),
+			vtype=int,
+			elementwise_evaluation=False,
+		)
+
+	def _decode_params(self, x: np.ndarray) -> dict[str, int]:
+		params: dict[str, int] = {}
+		for raw_value, spec in zip(x.tolist(), self.parameter_specs, strict=True):
+			params[spec.name] = int(raw_value) * int(spec.scale)
+		return params
+
+	def _evaluate(self, X: np.ndarray, out: dict[str, Any], *args: Any, **kwargs: Any):
+		objective_rows: list[list[float]] = []
+		params_list = [self._decode_params(np.asarray(x, dtype=int)) for x in X]
+		results = self.stage._evaluate_candidates(params_list)
+
+		for params, scme in zip(params_list, results, strict=True):
+			if scme is None:
+				f = [1e30, 1e30, 1e30]
+			else:
+				f = [float(scme.energy), float(scme.latency), float(scme.accelerator.area)]
+
+			score = self.stage._score_objectives(f)
+			if scme is not None and score < self.best_score:
+				self.best_score = score
+				self.best_params = params
+				self.best_scme = scme
+
+			objective_rows.append(f)
+
+		out["F"] = np.asarray(objective_rows, dtype=float)
+
+
+class GeneticHardwareStage(Stage):
+	"""Optimize template parameters with NSGA-II and pass best candidate to downstream stages.
+
+	Expected kwargs:
+	- hardware_template: path to a Jinja2 yaml accelerator template.
+	- hardware_ga_parameter_specs: list of dicts with keys {name, lower, upper, scale?}.
+
+	Optional kwargs:
+	- hardware_ga_generations (default 3)
+	- hardware_ga_population (default 8)
+	- hardware_ga_seed (default 42)
+	- template_params (base template context dict, merged with candidate params)
+	"""
+
+	def __init__(self, list_of_callables: list[StageCallable], **kwargs: Any):
+		super().__init__(list_of_callables, **kwargs)
+		self.accelerator: Accelerator = kwargs["accelerator"]
+		self.workload = kwargs["workload"]
+		self.hardware_template: str | None = kwargs.get("hardware_template")
+		self.template_params: dict[str, Any] = dict(kwargs.get("template_params", {}))
+		self.parameter_specs = self._parse_parameter_specs(kwargs.get("hardware_ga_parameter_specs", []))
+
+		self.ga_generations = int(kwargs.get("hardware_ga_generations", 3))
+		self.ga_population = int(kwargs.get("hardware_ga_population", 8))
+		self.ga_seed = int(kwargs.get("hardware_ga_seed", 42))
+		self.ga_workers = max(1, int(kwargs.get("hardware_ga_workers", os.cpu_count() or 1)))
+		self.ga_weight_energy = float(kwargs.get("hardware_ga_weight_energy", 1.0))
+		self.ga_weight_latency = float(kwargs.get("hardware_ga_weight_latency", 1.0))
+		self.ga_weight_area = float(kwargs.get("hardware_ga_weight_area", 1.0))
+
+	@staticmethod
+	def _parse_parameter_specs(raw_specs: Any) -> list[HardwareGAParameter]:
+		specs: list[HardwareGAParameter] = []
+		if not raw_specs:
+			return specs
+		for raw in raw_specs:
+			specs.append(
+				HardwareGAParameter(
+					name=str(raw["name"]),
+					lower=int(raw["lower"]),
+					upper=int(raw["upper"]),
+					scale=int(raw.get("scale", 1)),
+				)
+			)
+		return specs
+
+	def run(self):
+		# If no GA configuration is provided, keep existing behavior and pass-through.
+		if not self.hardware_template or not self.parameter_specs:
+			logger.info("GeneticHardwareStage disabled (missing template or parameter specs).")
+			kwargs = self.kwargs.copy()
+			kwargs["accelerator"] = self.accelerator
+			kwargs["workload"] = self.workload
+			sub_stage = self.list_of_callables[0](self.list_of_callables[1:], **kwargs)
+			yield from sub_stage.run()
+			return
+
+		logger.info(
+			"Starting hardware NSGA-II: vars=%d, pop=%d, generations=%d, workers=%d",
+			len(self.parameter_specs),
+			self.ga_population,
+			self.ga_generations,
+			self.ga_workers,
+		)
+		problem = _HardwareTemplateProblem(self, self.parameter_specs)
+		algorithm = NSGA2(pop_size=self.ga_population)
+		minimize(
+			problem,
+			algorithm,
+			termination=("n_gen", self.ga_generations),
+			seed=self.ga_seed,
+			verbose=False,
+		)
+
+		if problem.best_params is None:
+			raise RuntimeError("Hardware GA did not produce any valid candidate.")
+
+		logger.info("Best hardware parameters from GA: %s", problem.best_params)
+		best_accelerator = self._build_accelerator_from_template(problem.best_params)
+
+		kwargs = self.kwargs.copy()
+		kwargs["accelerator"] = best_accelerator
+		kwargs["workload"] = self.workload
+		kwargs["selected_hardware_params"] = problem.best_params
+		sub_stage = self.list_of_callables[0](self.list_of_callables[1:], **kwargs)
+		yield from sub_stage.run()
+
+	def _evaluate_candidates(self, params_list: list[dict[str, int]]) -> list[Any | None]:
+		if self.ga_workers <= 1 or len(params_list) <= 1:
+			return [self._safe_evaluate_candidate(params) for params in params_list]
+
+		workers = min(self.ga_workers, len(params_list))
+		global _MP_EVAL_STAGE
+		_MP_EVAL_STAGE = self
+		try:
+			ctx = mp.get_context("fork")
+			with ctx.Pool(processes=workers) as pool:
+				return pool.map(_mp_safe_evaluate_candidate, params_list)
+		except Exception:
+			logger.exception("Multiprocessing candidate evaluation failed; falling back to sequential evaluation.")
+			return [self._safe_evaluate_candidate(params) for params in params_list]
+		finally:
+			_MP_EVAL_STAGE = None
+
+	def _safe_evaluate_candidate(self, params: dict[str, int]) -> Any | None:
+		try:
+			return self._evaluate_candidate(params)
+		except Exception:
+			logger.exception("Candidate evaluation failed for params=%s", params)
+			return None
+
+	def _score_objectives(self, objectives: list[float]) -> float:
+		energy, latency, area = objectives
+		return (
+			self.ga_weight_energy * float(energy)
+			+ self.ga_weight_latency * float(latency)
+			+ self.ga_weight_area * float(area)
+		)
+
+	def _evaluate_candidate(self, params: dict[str, int]):
+		candidate_accelerator = self._build_accelerator_from_template(params)
+		kwargs = self.kwargs.copy()
+		kwargs["accelerator"] = candidate_accelerator
+		kwargs["workload"] = self.workload
+
+		if not self.list_of_callables:
+			raise RuntimeError("GeneticHardwareStage requires downstream stages.")
+
+		zigzag_stage = self.list_of_callables[0]
+
+		with tempfile.TemporaryDirectory(prefix="ga_hw_eval_") as tmp_dir:
+			self._override_candidate_paths(kwargs, Path(tmp_dir))
+			# During GA exploration, run only ZigZagCoreMappingEstimationStage,
+			# not full constraint optimization.
+			sub_stage = zigzag_stage([_CollectZigZagStatsLeaf], **kwargs)
+			answers = list(sub_stage.run())
+
+		if not answers:
+			raise RuntimeError("No result returned by ZigZag candidate evaluation.")
+
+		_, extra_info = answers[0]
+		if not isinstance(extra_info, dict):
+			raise RuntimeError("Invalid ZigZag candidate evaluation output.")
+
+		cost_lut = extra_info.get("cost_lut")
+		workload = extra_info.get("workload")
+		accelerator = extra_info.get("accelerator", candidate_accelerator)
+		if cost_lut is None or workload is None:
+			raise RuntimeError("Missing cost_lut/workload in ZigZag candidate evaluation output.")
+
+		return self._build_proxy_scme_from_cost_lut(cost_lut, workload, accelerator)
+
+	@staticmethod
+	def _build_proxy_scme_from_cost_lut(cost_lut: Any, workload: Any, accelerator: Any) -> Any:
+		"""Aggregate per-node best ZigZag estimates into a proxy SCME-like object."""
+		total_energy = 0.0
+		total_latency = 0.0
+
+		for node in get_unique_nodes(workload):
+			equal_node = cost_lut.get_equal_node(node) or node
+			cores = cost_lut.get_cores(equal_node)
+			if not cores:
+				raise RuntimeError(f"No ZigZag CME found for node {node}.")
+
+			best_node_energy = float("inf")
+			best_node_latency = float("inf")
+			for core in cores:
+				cme = cost_lut.get_cme(equal_node, core)
+				energy = float(getattr(cme, "energy_total", getattr(cme, "energy", 1e30)))
+				latency = float(getattr(cme, "latency_total2", getattr(cme, "latency", 1e30)))
+				best_node_energy = min(best_node_energy, energy)
+				best_node_latency = min(best_node_latency, latency)
+
+			total_energy += best_node_energy
+			total_latency += best_node_latency
+
+		return SimpleNamespace(
+			energy=total_energy,
+			latency=total_latency,
+			accelerator=SimpleNamespace(area=float(getattr(accelerator, "area", 1e30))),
+		)
+
+		return answers[0][0]
+
+	@staticmethod
+	def _override_candidate_paths(kwargs: dict[str, Any], root: Path) -> None:
+		path_keys = [
+			"tiled_workload_path",
+			"cost_lut_path",
+			"allocations_path",
+			"tiled_workload_post_co_path",
+			"cost_lut_post_co_path",
+		]
+		for key in path_keys:
+			if key not in kwargs:
+				continue
+
+			original = str(kwargs[key])
+			base_name = os.path.basename(original.rstrip("/")) or key
+			if key == "allocations_path":
+				destination = root / "allocations"
+				destination.mkdir(parents=True, exist_ok=True)
+				kwargs[key] = str(destination) + "/"
+			else:
+				kwargs[key] = str(root / base_name)
+
+	def _build_accelerator_from_template(self, candidate_params: dict[str, int]) -> Accelerator:
+		assert self.hardware_template is not None
+		context = dict(self.template_params)
+		context.update(candidate_params)
+
+		rendered_yaml = self._render_template(self.hardware_template, context)
+		accelerator_data = yaml.safe_load(rendered_yaml)
+
+		validator = AcceleratorValidator(accelerator_data, self.hardware_template)
+		accelerator_data = validator.normalized_data
+		if not validator.validate():
+			raise ValueError("Failed to validate accelerator generated from hardware template.")
+
+		factory = AcceleratorFactory(accelerator_data)
+		return factory.create()
+
+	@staticmethod
+	def _render_template(template_path: str, context: dict[str, Any]) -> str:
+		template_file = Path(template_path)
+		env = Environment(loader=FileSystemLoader(str(template_file.parent)))
+		template = env.get_template(template_file.name)
+		return template.render(**context)
+
+
+class _CollectZigZagStatsLeaf(Stage):
+	"""Leaf stage used internally to retrieve ZigZag cost LUT stats for GA scoring."""
+
+	def is_leaf(self) -> bool:
+		return True
+
+	def run(self):
+		extra_info = {
+			"cost_lut": self.kwargs.get("cost_lut"),
+			"workload": self.kwargs.get("workload"),
+			"accelerator": self.kwargs.get("accelerator"),
+		}
+		yield SimpleNamespace(), extra_info

@@ -15,7 +15,8 @@ from stream.stages.generation.layer_stacks_generation import LayerStacksGenerati
 from stream.stages.generation.scheduling_order_generation import SchedulingOrderGenerationStage
 from stream.stages.generation.tiled_workload_generation import TiledWorkloadGenerationStage
 from stream.stages.generation.tiling_generation import TilingGenerationStage
-from stream.stages.parsing.accelerator_parser import AcceleratorParserStage
+from stages.accelerator_template_parser import AcceleratorTemplateParserStage
+from stages.genetichardware import GeneticHardwareStage
 from stream.stages.parsing.onnx_model_parser import ONNXModelParserStage as StreamONNXModelParserStage
 from stream.stages.set_fixed_allocation_performance import SetFixedAllocationPerformanceStage
 from stream.stages.stage import MainStage
@@ -63,6 +64,11 @@ def optimize_single_hardware_co(  # noqa: PLR0913
     output_path: str,
     skip_if_exists: bool = False,
     temporal_mapping_type: str = "uneven",
+    template_params: dict | None = None,
+    hardware_ga_parameter_specs: list[dict] | None = None,
+    hardware_ga_generations: int = 3,
+    hardware_ga_population: int = 8,
+    hardware_ga_seed: int = 42,
 ) -> StreamCostModelEvaluation:
     _sanity_check_inputs(hardware_template, workload, mode, output_path)
     _sanity_check_gurobi_license()
@@ -104,16 +110,24 @@ def optimize_single_hardware_co(  # noqa: PLR0913
             ZigZagCoreMappingEstimationStage,
             ConstraintOptimizationAllocationStage,
         ],
+            accelerator=hardware_template,
             hardware_template=hardware_template,
             workload_path=workload,
             mode=mode,
             layer_stacks=layer_stacks,
+            loma_lpf_limit=6,
             tiled_workload_path=tiled_workload_path,
             cost_lut_path=cost_lut_path,
             allocations_path=allocations_path,
             tiled_workload_post_co_path=tiled_workload_post_co_path,
             cost_lut_post_co_path=cost_lut_post_co_path,
             temporal_mapping_type=temporal_mapping_type,
+            operands_to_prefetch=[],
+            template_params=template_params or {},
+            hardware_ga_parameter_specs=hardware_ga_parameter_specs or [],
+            hardware_ga_generations=hardware_ga_generations,
+            hardware_ga_population=hardware_ga_population,
+            hardware_ga_seed=hardware_ga_seed,
         )
         # Launch the MainStage
         answers = mainstage.run()
