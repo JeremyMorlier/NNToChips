@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import multiprocessing as mp
 import os
@@ -58,6 +59,7 @@ class _HardwareTemplateProblem(Problem):
 		self.best_score = float("inf")
 		self.best_params: dict[str, int] | None = None
 		self.best_scme = None
+		self.evaluation_count = 0
 
 		super().__init__(
 			n_var=len(parameter_specs),
@@ -81,12 +83,26 @@ class _HardwareTemplateProblem(Problem):
 		results = self.stage._evaluate_candidates(params_list)
 
 		for params, scme in zip(params_list, results, strict=True):
+			self.evaluation_count += 1
 			if scme is None:
 				f = [1e30, 1e30, 1e30]
+				status = "failed"
 			else:
 				f = [float(scme.energy), float(scme.latency), float(scme.accelerator.area)]
+				status = "ok"
 
 			score = self.stage._score_objectives(f)
+			self.stage._record_evaluation(
+				{
+					"evaluation_index": self.evaluation_count,
+					"params": params,
+					"energy": float(f[0]),
+					"latency": float(f[1]),
+					"area": float(f[2]),
+					"score": float(score),
+					"status": status,
+				}
+			)
 			if scme is not None and score < self.best_score:
 				self.best_score = score
 				self.best_params = params
@@ -139,6 +155,58 @@ class GeneticHardwareStage(Stage):
 		self.ga_weight_energy = float(kwargs.get("hardware_ga_weight_energy", 1.0))
 		self.ga_weight_latency = float(kwargs.get("hardware_ga_weight_latency", 1.0))
 		self.ga_weight_area = float(kwargs.get("hardware_ga_weight_area", 1.0))
+		self._ga_evaluations: list[dict[str, Any]] = []
+
+	def _record_evaluation(self, evaluation: dict[str, Any]) -> None:
+		self._ga_evaluations.append(evaluation)
+
+	def _save_ga_history_json(self, problem: _HardwareTemplateProblem, result: Any) -> None:
+		cost_lut_path = self.kwargs.get("cost_lut_path")
+		if not cost_lut_path:
+			logger.warning("Cannot save GA history: missing cost_lut_path in stage kwargs.")
+			return
+
+		run_dir = Path(str(cost_lut_path)).resolve().parent
+		run_dir.mkdir(parents=True, exist_ok=True)
+		history_path = run_dir / "hardware_ga_history.json"
+
+		pareto_front: list[dict[str, Any]] = []
+		if getattr(result, "X", None) is not None and getattr(result, "F", None) is not None:
+			xs = result.X.tolist() if hasattr(result.X, "tolist") else [result.X]
+			fs = result.F.tolist() if hasattr(result.F, "tolist") else [result.F]
+			for x, f in zip(xs, fs, strict=False):
+				params = problem._decode_params(np.asarray(x, dtype=int))
+				pareto_front.append(
+					{
+						"x": [int(v) for v in np.asarray(x, dtype=int).tolist()],
+						"params": params,
+						"energy": float(f[0]),
+						"latency": float(f[1]),
+						"area": float(f[2]),
+					}
+				)
+
+		summary = {
+			"population": self.ga_population,
+			"generations": self.ga_generations,
+			"seed": self.ga_seed,
+			"workers": self.ga_workers,
+			"weights": {
+				"energy": self.ga_weight_energy,
+				"latency": self.ga_weight_latency,
+				"area": self.ga_weight_area,
+			},
+			"target_core_id": self.hardware_ga_target_core_id,
+			"stack_index": self.hardware_ga_stack_index,
+			"num_evaluations": len(self._ga_evaluations),
+			"best_params": problem.best_params,
+			"best_score": float(problem.best_score),
+			"pareto_front": pareto_front,
+			"all_evaluations": self._ga_evaluations,
+		}
+
+		history_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+		logger.info("Saved hardware GA history to %s", history_path)
 
 	@staticmethod
 	def _parse_parameter_specs(raw_specs: Any) -> list[HardwareGAParameter]:
@@ -178,13 +246,14 @@ class GeneticHardwareStage(Stage):
 		)
 		problem = _HardwareTemplateProblem(self, self.parameter_specs)
 		algorithm = NSGA2(pop_size=self.ga_population)
-		minimize(
+		result = minimize(
 			problem,
 			algorithm,
 			termination=("n_gen", self.ga_generations),
 			seed=self.ga_seed,
 			verbose=False,
 		)
+		self._save_ga_history_json(problem, result)
 
 		if problem.best_params is None:
 			raise RuntimeError("Hardware GA did not produce any valid candidate.")

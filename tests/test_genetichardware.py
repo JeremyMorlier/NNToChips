@@ -26,6 +26,9 @@ class RecorderLeafStage(Stage):
 class FakeEvalStage:
     """Minimal object exposing the methods expected by _HardwareTemplateProblem."""
 
+    def __init__(self):
+        self.evaluations = []
+
     def _evaluate_candidate(self, params: dict[str, int]):
         x = params["p"]
         # Lower is better for all three objectives.
@@ -41,6 +44,9 @@ class FakeEvalStage:
     @staticmethod
     def _score_objectives(objectives: list[float]) -> float:
         return float(sum(objectives))
+
+    def _record_evaluation(self, evaluation: dict):
+        self.evaluations.append(evaluation)
 
 
 def test_parse_parameter_specs():
