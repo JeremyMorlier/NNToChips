@@ -157,7 +157,7 @@ def test_optimized_tiled_workload_generation_optimizes_single_core_nodes(monkeyp
 
     monkeypatch.setattr(stage, "_select_best_candidate", _fake_select_best_candidate)
 
-    stage.optimize_layer_tilings_and_allocations()
+    stage.optimize_layer_tilings()
 
     assert called["count"] == 1
     assert fake_node.inter_core_tiling == [(optimized_stage_module.LayerDim("K"), 2)]

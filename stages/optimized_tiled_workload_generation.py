@@ -62,10 +62,6 @@ class OptimizedTiledWorkloadGenerationStage(TiledWorkloadGenerationStage):
         self.optimize_layer_tilings()
         yield from super().run()
 
-    # Backward compatibility for existing call-sites/tests.
-    def optimize_layer_tilings_and_allocations(self):
-        self.optimize_layer_tilings()
-
     def optimize_layer_tilings(self):
         for node in self.workload.node_list:
             if not isinstance(node, ComputationNode):
