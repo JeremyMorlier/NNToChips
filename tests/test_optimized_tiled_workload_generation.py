@@ -144,6 +144,7 @@ def test_optimized_tiled_workload_generation_optimizes_single_core_nodes(monkeyp
         workload=fake_workload,
         accelerator=fake_accelerator,
         tiled_workload_path="/tmp/fake_tiled_workload.pickle",
+        optimization_method="ilp",
     )
 
     called = {"count": 0}
