@@ -11,6 +11,7 @@ from stream.cost_model.cost_model import StreamCostModelEvaluation
 from stream.stages.allocation.constraint_optimization_allocation import (
     ConstraintOptimizationAllocationStage,
 )
+
 from stream.stages.allocation.genetic_algorithm_allocation import (
     GeneticAlgorithmAllocationStage,
 )
@@ -21,15 +22,14 @@ from stream.stages.generation.layer_stacks_generation import LayerStacksGenerati
 from stream.stages.generation.scheduling_order_generation import (
     SchedulingOrderGenerationStage,
 )
-from stream.stages.generation.tiled_workload_generation import (
-    TiledWorkloadGenerationStage,
-)
+
+# from stream.stages.generation.tiled_workload_generation import (
+#     TiledWorkloadGenerationStage,
+# )
 from stream.stages.generation.tiling_generation import TilingGenerationStage
 from stages.accelerator_template_parser import AcceleratorTemplateParserStage
 from stages.genetichardware import GeneticHardwareStage
-from stages.optimized_tiled_workload_generation import (
-    OptimizedTiledWorkloadGenerationStage,
-)
+from stages.tiling_genetic_optimization import TilingGeneticOptimizationStage
 from stream.stages.parsing.onnx_model_parser import (
     ONNXModelParserStage as StreamONNXModelParserStage,
 )
@@ -98,6 +98,16 @@ def optimize_single_hardware_co(  # noqa: PLR0913
     hardware_ga_population: int = 8,
     hardware_ga_seed: int = 42,
     hardware_ga_workers: int | None = None,
+    intra_tiling_options: dict[int | str, list[list[tuple[str, int | str]]]] | None = None,
+    inter_tiling_options: dict[int | str, list[list[tuple[str, int | str]]]] | None = None,
+    tiling_ga_generations: int = 6,
+    tiling_ga_population: int = 24,
+    tiling_ga_seed: int = 42,
+    tiling_force_inter_wildcard: bool = True,
+    tiling_weight_tiles: float = 1.0,
+    tiling_weight_edges: float = 1.0,
+    tiling_weight_inter_edges: float = 2.0,
+    tiling_weight_inter_bits: float = 1e-6,
 ) -> StreamCostModelEvaluation:
     _sanity_check_inputs(hardware_template, workload, mode, output_path)
     _sanity_check_gurobi_license()
@@ -138,7 +148,7 @@ def optimize_single_hardware_co(  # noqa: PLR0913
                 AcceleratorTemplateParserStage,
                 StreamONNXModelParserStageNoMapping,
                 TilingGenerationStage,
-                TiledWorkloadGenerationStage,
+                TilingGeneticOptimizationStage,
                 LayerStacksGenerationStage,
                 GeneticHardwareStage,
                 ZigZagCoreMappingEstimationStage,
@@ -166,109 +176,18 @@ def optimize_single_hardware_co(  # noqa: PLR0913
             hardware_ga_population=hardware_ga_population,
             hardware_ga_seed=hardware_ga_seed,
             hardware_ga_workers=hardware_ga_workers,
+            intra_tiling_options=intra_tiling_options or {},
+            inter_tiling_options=inter_tiling_options or {},
+            tiling_ga_generations=tiling_ga_generations,
+            tiling_ga_population=tiling_ga_population,
+            tiling_ga_seed=tiling_ga_seed,
+            tiling_force_inter_wildcard=tiling_force_inter_wildcard,
+            tiling_weight_tiles=tiling_weight_tiles,
+            tiling_weight_edges=tiling_weight_edges,
+            tiling_weight_inter_edges=tiling_weight_inter_edges,
+            tiling_weight_inter_bits=tiling_weight_inter_bits,
         )
         # Launch the MainStage
-        answers = mainstage.run()
-        scme = answers[0][0]
-        pickle_save(scme, scme_path)  # type: ignore
-    return scme
-
-
-def optimize_single_hardware_co_with_tiling_optimization(  # noqa: PLR0913
-    hardware_template: str,
-    workload: str,
-    mode: Literal["lbl"] | Literal["fused"],
-    layer_stacks: list[tuple[int, ...]],
-    experiment_id: str,
-    output_path: str,
-    skip_if_exists: bool = False,
-    temporal_mapping_type: str = "uneven",
-    template_params: dict | None = None,
-    hardware_ga_parameter_specs: list[dict] | None = None,
-    hardware_ga_core_template: str | None = None,
-    hardware_ga_core_template_params: dict | None = None,
-    hardware_ga_target_core_id: int = 0,
-    hardware_ga_generations: int = 3,
-    hardware_ga_population: int = 8,
-    hardware_ga_seed: int = 42,
-    hardware_ga_workers: int | None = None,
-    tiling_optimization_method: Literal["ga"] | Literal["ilp"] = "ga",
-    max_inter_core_factor: int = 16,
-    max_intra_core_factor: int = 8,
-    tile_alloc_ga_generations: int = 12,
-    tile_alloc_ga_population: int = 24,
-    tile_alloc_random_seed: int | None = None,
-) -> StreamCostModelEvaluation:
-    """Optimize one hardware with CO while including per-layer tiling optimization."""
-    _sanity_check_inputs(hardware_template, workload, mode, output_path)
-    _sanity_check_gurobi_license()
-
-    os.makedirs(f"{output_path}/{experiment_id}", exist_ok=True)
-
-    tiled_workload_path = f"{output_path}/{experiment_id}/tiled_workload.pickle"
-    cost_lut_path = f"{output_path}/{experiment_id}/cost_lut.pickle"
-    allocations_path = f"{output_path}/{experiment_id}/waco/"
-    tiled_workload_post_co_path = (
-        f"{output_path}/{experiment_id}/tiled_workload_post_co.pickle"
-    )
-    cost_lut_post_co_path = f"{output_path}/{experiment_id}/cost_lut_post_co.pickle"
-    scme_path = f"{output_path}/{experiment_id}/scme.pickle"
-
-    logger = _logging.getLogger(__name__)
-
-    if temporal_mapping_type == "uneven":
-        temporal_mapping_type = TemporalMappingType.UNEVEN
-    elif temporal_mapping_type == "even":
-        temporal_mapping_type = TemporalMappingType.EVEN
-    else:
-        raise ValueError(
-            f"Invalid temporal mapping type: {temporal_mapping_type}. Must be 'uneven' or 'even'."
-        )
-
-    if os.path.exists(scme_path) and skip_if_exists:
-        scme = pickle_load(scme_path)
-        logger.info(f"Loaded SCME from {scme_path}")
-    else:
-        mainstage = MainStage(
-            [
-                AcceleratorTemplateParserStage,
-                StreamONNXModelParserStageNoMapping,
-                TilingGenerationStage,
-                OptimizedTiledWorkloadGenerationStage,
-                LayerStacksGenerationStage,
-                # GeneticHardwareStage,
-                # ZigZagCoreMappingEstimationStage,
-                # ConstraintOptimizationAllocationStage,
-            ],
-            accelerator=hardware_template,
-            hardware_template=hardware_template,
-            workload_path=workload,
-            mode=mode,
-            layer_stacks=layer_stacks,
-            loma_lpf_limit=6,
-            tiled_workload_path=tiled_workload_path,
-            cost_lut_path=cost_lut_path,
-            allocations_path=allocations_path,
-            tiled_workload_post_co_path=tiled_workload_post_co_path,
-            cost_lut_post_co_path=cost_lut_post_co_path,
-            temporal_mapping_type=temporal_mapping_type,
-            operands_to_prefetch=[],
-            template_params=template_params or {},
-            hardware_ga_parameter_specs=hardware_ga_parameter_specs or [],
-            hardware_ga_core_template=hardware_ga_core_template,
-            hardware_ga_core_template_params=hardware_ga_core_template_params or {},
-            hardware_ga_target_core_id=hardware_ga_target_core_id,
-            hardware_ga_generations=hardware_ga_generations,
-            hardware_ga_population=hardware_ga_population,
-            hardware_ga_seed=hardware_ga_seed,
-            hardware_ga_workers=hardware_ga_workers,
-            optimization_method=tiling_optimization_method,
-            max_inter_core_factor=max_inter_core_factor,
-            max_intra_core_factor=max_intra_core_factor,
-            tile_alloc_ga_generations=tile_alloc_ga_generations,
-            tile_alloc_ga_population=tile_alloc_ga_population,
-            tile_alloc_random_seed=tile_alloc_random_seed,
-        )
         answers = mainstage.run()
         scme = answers[0][0]
         pickle_save(scme, scme_path)  # type: ignore
@@ -294,6 +213,16 @@ def optimize_single_hardware_co_with_mapping(  # noqa: PLR0913
     hardware_ga_population: int = 8,
     hardware_ga_seed: int = 42,
     hardware_ga_workers: int | None = None,
+    intra_tiling_options: dict[int | str, list[list[tuple[str, int | str]]]] | None = None,
+    inter_tiling_options: dict[int | str, list[list[tuple[str, int | str]]]] | None = None,
+    tiling_ga_generations: int = 6,
+    tiling_ga_population: int = 24,
+    tiling_ga_seed: int = 42,
+    tiling_force_inter_wildcard: bool = True,
+    tiling_weight_tiles: float = 1.0,
+    tiling_weight_edges: float = 1.0,
+    tiling_weight_inter_edges: float = 2.0,
+    tiling_weight_inter_bits: float = 1e-6,
 ) -> StreamCostModelEvaluation:
     _sanity_check_inputs(hardware_template, workload, mode, output_path)
     _sanity_check_gurobi_license()
@@ -334,7 +263,7 @@ def optimize_single_hardware_co_with_mapping(  # noqa: PLR0913
                 AcceleratorTemplateParserStage,
                 StreamONNXModelParserStage,
                 TilingGenerationStage,
-                TiledWorkloadGenerationStage,
+                TilingGeneticOptimizationStage,
                 LayerStacksGenerationStage,
                 GeneticHardwareStage,
                 ZigZagCoreMappingEstimationStage,
@@ -363,6 +292,16 @@ def optimize_single_hardware_co_with_mapping(  # noqa: PLR0913
             hardware_ga_population=hardware_ga_population,
             hardware_ga_seed=hardware_ga_seed,
             hardware_ga_workers=hardware_ga_workers,
+            intra_tiling_options=intra_tiling_options or {},
+            inter_tiling_options=inter_tiling_options or {},
+            tiling_ga_generations=tiling_ga_generations,
+            tiling_ga_population=tiling_ga_population,
+            tiling_ga_seed=tiling_ga_seed,
+            tiling_force_inter_wildcard=tiling_force_inter_wildcard,
+            tiling_weight_tiles=tiling_weight_tiles,
+            tiling_weight_edges=tiling_weight_edges,
+            tiling_weight_inter_edges=tiling_weight_inter_edges,
+            tiling_weight_inter_bits=tiling_weight_inter_bits,
         )
         # Launch the MainStage
         answers = mainstage.run()

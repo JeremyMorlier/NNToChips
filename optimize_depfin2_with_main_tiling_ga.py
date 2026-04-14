@@ -93,31 +93,6 @@ def create_soc_template(template_path: Path) -> None:
     template_path.write_text(template_content, encoding="utf-8")
 
 
-def build_tiling_options() -> tuple[
-    dict[int, list[list[tuple[str, int | str]]]],
-    dict[int, list[list[tuple[str, int | str]]]],
-]:
-    """Small generic candidate sets. Invalid dims for a node are ignored by the stage."""
-    node_ids = [*range(0, 49)]
-
-    intra_options: dict[int, list[list[tuple[str, int | str]]]] = {}
-    inter_options: dict[int, list[list[tuple[str, int | str]]]] = {}
-
-    for node_id in node_ids:
-        intra_options[node_id] = [
-            [],
-            [("OY", 2)],
-            [("K", 2)],
-        ]
-        inter_options[node_id] = [
-            [("K", 1)],
-            [("K", "*")],
-            [("OY", "*")],
-        ]
-
-    return intra_options, inter_options
-
-
 def main():
     args = parse_args()
 
@@ -162,8 +137,6 @@ def main():
         {"name": "d2_size", "lower": 8, "upper": 32, "scale": 1},
     ]
 
-    intra_tiling_options, inter_tiling_options = build_tiling_options()
-
     logging.info("Starting optimize_single_hardware_co with hardware+tiling GA flow")
     scme = optimize_single_hardware_co(
         hardware_template=str(hw_template_path),
@@ -181,8 +154,6 @@ def main():
         hardware_ga_generations=args.hw_generations,
         hardware_ga_population=args.hw_pop_size,
         hardware_ga_seed=args.seed,
-        intra_tiling_options=intra_tiling_options,
-        inter_tiling_options=inter_tiling_options,
         tiling_ga_generations=args.tiling_generations,
         tiling_ga_population=args.tiling_pop_size,
         tiling_ga_seed=args.seed,

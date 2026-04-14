@@ -9,6 +9,7 @@ import numpy as np
 from pymoo.algorithms.moo.nsga2 import NSGA2
 from pymoo.core.problem import Problem
 from pymoo.optimize import minimize
+from zigzag.datatypes import LayerDim
 from zigzag.utils import pickle_deepcopy
 
 from stream.stages.generation.tiled_workload_generation import (
@@ -25,12 +26,14 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
-class TilingChoiceSpec:
-    """One discrete GA variable selecting a tiling option for a specific node and tiling kind."""
+class TilingIntVarSpec:
+    """One integer GA variable for a node tiling factor."""
 
     node_id: int
     kind: Literal["intra", "inter"]
-    choices: tuple[TILING_T | TILING_WILDCARD_T, ...]
+    layer_dim: LayerDim
+    lower: int
+    upper: int
 
 
 class _TilingGAProblem(Problem):
@@ -39,20 +42,19 @@ class _TilingGAProblem(Problem):
     def __init__(
         self,
         stage: "TilingGeneticOptimizationStage",
-        choice_specs: list[TilingChoiceSpec],
+        var_specs: list[TilingIntVarSpec],
     ):
         self.stage = stage
-        self.choice_specs = choice_specs
+        self.var_specs = var_specs
         self.best_score = float("inf")
         self.best_vector: tuple[int, ...] | None = None
-        self.best_metrics: dict[str, int] | None = None
 
         super().__init__(
-            n_var=len(choice_specs),
+            n_var=len(var_specs),
             n_obj=4,  # num_tiles, total_edges, inter_edges, inter_bits
             n_constr=0,
-            xl=np.zeros(len(choice_specs), dtype=int),
-            xu=np.array([len(spec.choices) - 1 for spec in choice_specs], dtype=int),
+            xl=np.array([spec.lower for spec in var_specs], dtype=int),
+            xu=np.array([spec.upper for spec in var_specs], dtype=int),
             vtype=int,
             elementwise_evaluation=False,
         )
@@ -85,7 +87,6 @@ class _TilingGAProblem(Problem):
             if metrics is not None and score < self.best_score:
                 self.best_score = score
                 self.best_vector = vector
-                self.best_metrics = metrics
 
             objective_rows.append(f)
 
@@ -103,17 +104,18 @@ class _CollectTiledWorkloadLeaf(Stage):
 
 
 class TilingGeneticOptimizationStage(TilingCombinationEvaluationStage):
-    """Optimize intra/inter tiling combinations with NSGA-II and heuristic scoring.
+    """Optimize intra/inter tiling with integer GA variables inferred from node layer dimensions.
 
-    Inherits parsing/normalization/scoring from TilingCombinationEvaluationStage.
+    Variables are generated per node:
+    - Intra-core: one integer variable per non-batch layer dimension with size > 1
+    - Inter-core: one integer variable for the node's inter-core partition dimension
 
     Extra kwargs:
     - tiling_ga_generations: int (default 6)
     - tiling_ga_population: int (default 24)
     - tiling_ga_seed: int (default 42)
     - tiling_force_inter_wildcard: bool (default True)
-      If True, any inter-core factor > 1 is converted to '*' to stay compatible with
-      downstream ConstraintOptimizationAllocationStage scheduling assumptions.
+      If True, decoded inter factor > 1 is represented as '*', preserving CO compatibility.
     """
 
     _EVAL_KWARGS = TilingCombinationEvaluationStage._EVAL_KWARGS.union(
@@ -130,10 +132,12 @@ class TilingGeneticOptimizationStage(TilingCombinationEvaluationStage):
         self.ga_generations = int(kwargs.get("tiling_ga_generations", 6))
         self.ga_population = int(kwargs.get("tiling_ga_population", 24))
         self.ga_seed = int(kwargs.get("tiling_ga_seed", 42))
-        self.force_inter_wildcard = bool(kwargs.get("tiling_force_inter_wildcard", True))
+        self.force_inter_wildcard = bool(
+            kwargs.get("tiling_force_inter_wildcard", True)
+        )
 
-        self._choice_specs: list[TilingChoiceSpec] = []
-        self._default_candidate: dict[int, dict[str, Any]] = {}
+        self._var_specs: list[TilingIntVarSpec] = []
+        self._base_candidate: dict[int, dict[str, Any]] = {}
         self._metrics_cache: dict[tuple[int, ...], dict[str, int] | None] = {}
         self._candidate_cache: dict[tuple[int, ...], dict[int, dict[str, Any]]] = {}
         self._vector_eval_ids: dict[tuple[int, ...], int] = {}
@@ -145,11 +149,13 @@ class TilingGeneticOptimizationStage(TilingCombinationEvaluationStage):
 
         with tempfile.TemporaryDirectory(prefix="tiling_ga_eval_") as tmp_dir:
             self._eval_tmp_dir = tmp_dir
-
-            if not self._choice_specs:
-                logger.info("No GA decision variables found. Falling back to current tilings.")
-                candidate = self._clone_candidate(self._default_candidate)
-                tiled_workload, scheduling_order = self._build_tiled_workload(
+            print(self._var_specs)
+            if not self._var_specs:
+                logger.info(
+                    "No tiling GA variables found. Falling back to current tilings."
+                )
+                candidate = self._clone_candidate(self._base_candidate)
+                tiled_workload, _ = self._build_tiled_workload(
                     candidate, 0, self._eval_tmp_dir
                 )
                 metrics = self._compute_heuristics(tiled_workload)
@@ -161,20 +167,18 @@ class TilingGeneticOptimizationStage(TilingCombinationEvaluationStage):
                         "score": self._score(metrics),
                     }
                 ]
-                yield from self._forward_best(
-                    candidate, tiled_workload, scheduling_order, evaluations
-                )
+                yield from self._forward_best(candidate, tiled_workload, evaluations)
                 yield None, None
                 return
 
             logger.info(
                 "Starting tiling NSGA-II: vars=%d, pop=%d, generations=%d",
-                len(self._choice_specs),
+                len(self._var_specs),
                 self.ga_population,
                 self.ga_generations,
             )
 
-            problem = _TilingGAProblem(self, self._choice_specs)
+            problem = _TilingGAProblem(self, self._var_specs)
             algorithm = NSGA2(pop_size=self.ga_population)
             result = minimize(
                 problem,
@@ -191,13 +195,14 @@ class TilingGeneticOptimizationStage(TilingCombinationEvaluationStage):
             best_metrics = self.evaluate_vector(problem.best_vector)
             if best_metrics is None:
                 raise RuntimeError("Best tiling candidate could not be re-evaluated.")
+
             best_candidate_idx = self._vector_eval_ids.get(problem.best_vector)
             if best_candidate_idx is None:
                 best_candidate_idx = self._next_eval_idx
                 self._next_eval_idx += 1
                 self._vector_eval_ids[problem.best_vector] = best_candidate_idx
 
-            tiled_workload, scheduling_order = self._build_tiled_workload(
+            tiled_workload, _ = self._build_tiled_workload(
                 best_candidate,
                 best_candidate_idx,
                 self._eval_tmp_dir,
@@ -210,14 +215,12 @@ class TilingGeneticOptimizationStage(TilingCombinationEvaluationStage):
                 self._serialize_candidate(best_candidate),
             )
 
-            yield from self._forward_best(
-                best_candidate, tiled_workload, scheduling_order, evaluations
-            )
+            yield from self._forward_best(best_candidate, tiled_workload, evaluations)
             yield None, None
 
     def _prepare_search_space(self, workload: ONNXWorkload) -> None:
-        self._choice_specs.clear()
-        self._default_candidate.clear()
+        self._var_specs.clear()
+        self._base_candidate.clear()
         self._metrics_cache.clear()
         self._candidate_cache.clear()
         self._vector_eval_ids.clear()
@@ -227,38 +230,59 @@ class TilingGeneticOptimizationStage(TilingCombinationEvaluationStage):
             if not isinstance(node, ComputationNode):
                 continue
 
-            default_intra = list(node.intra_core_tiling)
-            default_inter = list(node.inter_core_tiling)
-            self._default_candidate[node.id] = {
-                "intra": default_intra,
-                "inter": default_inter,
+            self._base_candidate[node.id] = {
+                "intra": [],
+                "inter": list(node.inter_core_tiling) if node.inter_core_tiling else [],
             }
 
-            intra_raw_options = self._lookup_node_options(self.intra_tiling_options, node.id)
-            if intra_raw_options:
-                intra_choices = tuple(
-                    self._normalize_intra_tiling(node, option) for option in intra_raw_options
-                )
-                if len(intra_choices) > 1:
-                    self._choice_specs.append(
-                        TilingChoiceSpec(node_id=node.id, kind="intra", choices=intra_choices)
+            # Intra-core integer vars for all useful layer dimensions.
+            for dim, dim_size in node.layer_dim_sizes.items():
+                if dim == LayerDim("B"):
+                    continue
+                if int(dim_size) <= 1:
+                    continue
+                upper = int(dim_size)
+                if upper < 1:
+                    continue
+                self._var_specs.append(
+                    TilingIntVarSpec(
+                        node_id=node.id,
+                        kind="intra",
+                        layer_dim=dim,
+                        lower=1,
+                        upper=upper,
                     )
-                elif len(intra_choices) == 1:
-                    self._default_candidate[node.id]["intra"] = list(intra_choices[0])
-
-            inter_raw_options = self._lookup_node_options(self.inter_tiling_options, node.id)
-            if inter_raw_options:
-                inter_choices = tuple(
-                    self._normalize_inter_tiling(node, option) for option in inter_raw_options
                 )
-                if len(inter_choices) > 1:
-                    self._choice_specs.append(
-                        TilingChoiceSpec(node_id=node.id, kind="inter", choices=inter_choices)
-                    )
-                elif len(inter_choices) == 1:
-                    self._default_candidate[node.id]["inter"] = list(inter_choices[0])
 
-    def _clone_candidate(self, candidate: dict[int, dict[str, Any]]) -> dict[int, dict[str, Any]]:
+            # Inter-core integer var for one partition dimension.
+            inter_dim = self._get_inter_dim_for_node(node)
+            if inter_dim is not None:
+                inter_size = int(node.layer_dim_sizes[inter_dim])
+                upper = inter_size
+                if upper >= 1:
+                    self._var_specs.append(
+                        TilingIntVarSpec(
+                            node_id=node.id,
+                            kind="inter",
+                            layer_dim=inter_dim,
+                            lower=1,
+                            upper=upper,
+                        )
+                    )
+
+    def _get_inter_dim_for_node(self, node: ComputationNode) -> LayerDim | None:
+        if node.inter_core_tiling:
+            return node.inter_core_tiling[0][0]
+
+        # Fallback: pick first non-batch dimension with size > 1.
+        for dim, dim_size in node.layer_dim_sizes.items():
+            if dim != LayerDim("B") and int(dim_size) > 1:
+                return dim
+        return None
+
+    def _clone_candidate(
+        self, candidate: dict[int, dict[str, Any]]
+    ) -> dict[int, dict[str, Any]]:
         cloned: dict[int, dict[str, Any]] = {}
         for node_id, cfg in candidate.items():
             cloned[node_id] = {
@@ -271,11 +295,28 @@ class TilingGeneticOptimizationStage(TilingCombinationEvaluationStage):
         if vector in self._candidate_cache:
             return self._clone_candidate(self._candidate_cache[vector])
 
-        candidate = self._clone_candidate(self._default_candidate)
-        for idx, spec in enumerate(self._choice_specs):
-            choice_idx = int(vector[idx])
-            selected = spec.choices[choice_idx]
-            candidate[spec.node_id][spec.kind] = list(selected)
+        intra_maps: dict[int, dict[LayerDim, int]] = {}
+        inter_maps: dict[int, tuple[LayerDim, int | str]] = {}
+
+        for idx, spec in enumerate(self._var_specs):
+            val = int(vector[idx])
+            if spec.kind == "intra":
+                if val > 1:
+                    intra_maps.setdefault(spec.node_id, {})[spec.layer_dim] = val
+            else:
+                inter_factor: int | str
+                if self.force_inter_wildcard and val > 1:
+                    inter_factor = "*"
+                else:
+                    inter_factor = val
+                inter_maps[spec.node_id] = (spec.layer_dim, inter_factor)
+
+        candidate = self._clone_candidate(self._base_candidate)
+        for node_id, dims_to_factor in intra_maps.items():
+            candidate[node_id]["intra"] = list(dims_to_factor.items())
+
+        for node_id, inter_entry in inter_maps.items():
+            candidate[node_id]["inter"] = [inter_entry]
 
         self._candidate_cache[vector] = self._clone_candidate(candidate)
         return candidate
@@ -308,6 +349,9 @@ class TilingGeneticOptimizationStage(TilingCombinationEvaluationStage):
             return history
 
         xs = result.X.tolist() if hasattr(result.X, "tolist") else [result.X]
+        if xs and isinstance(xs[0], (int, np.integer)):
+            xs = [xs]
+
         for idx, x in enumerate(xs):
             vector = tuple(int(v) for v in np.asarray(x, dtype=int).tolist())
             metrics = self.evaluate_vector(vector)
@@ -327,18 +371,17 @@ class TilingGeneticOptimizationStage(TilingCombinationEvaluationStage):
     def _forward_best(
         self,
         best_candidate: dict[int, dict[str, Any]],
-        best_tiled_workload,
-        best_scheduling_order: Any,
+        best_tiled_workload: ComputationNodeWorkload,
         evaluations: list[dict[str, Any]],
     ):
         best_original_workload = self._materialize_candidate_workload(best_candidate)
+
         kwargs = self.kwargs.copy()
         kwargs["original_workload"] = best_original_workload
         kwargs["workload"] = best_tiled_workload
         kwargs["accelerator"] = self.accelerator
         kwargs["selected_tiling_candidate"] = self._serialize_candidate(best_candidate)
         kwargs["tiling_candidate_evaluations"] = evaluations
-        # Avoid propagating any stale scheduling order into downstream stages.
         kwargs.pop("scheduling_order", None)
 
         sub_stage = self.list_of_callables[0](self.list_of_callables[1:], **kwargs)
@@ -351,35 +394,38 @@ class TilingGeneticOptimizationStage(TilingCombinationEvaluationStage):
         candidate_idx: int,
         tmp_dir: str,
     ) -> tuple[ComputationNodeWorkload, Any]:
-        """Build tiled workload with Stream's native TiledWorkloadGenerationStage for consistency downstream."""
-        candidate_workload: ONNXWorkload = pickle_deepcopy(self.workload)
+        """Build tiled workload with Stream's native TiledWorkloadGenerationStage."""
+        candidate_workload: ONNXWorkload = self._materialize_candidate_workload(
+            candidate
+        )
 
-        for node in candidate_workload.topological_sort():
-            if not isinstance(node, ComputationNode):
-                continue
-            if node.id not in candidate:
-                continue
-            node.intra_core_tiling = list(candidate[node.id]["intra"])
-            node.inter_core_tiling = list(candidate[node.id]["inter"])
-
-        candidate_tiled_path = f"{tmp_dir}/tiled_workload_candidate_{candidate_idx}.pickle"
-        stage_kwargs = self._build_tiled_stage_kwargs(candidate_workload, candidate_tiled_path)
-        tiled_stage = StreamTiledWorkloadGenerationStage([_CollectTiledWorkloadLeaf], **stage_kwargs)
+        candidate_tiled_path = (
+            f"{tmp_dir}/tiled_workload_candidate_{candidate_idx}.pickle"
+        )
+        stage_kwargs = self._build_tiled_stage_kwargs(
+            candidate_workload, candidate_tiled_path
+        )
+        tiled_stage = StreamTiledWorkloadGenerationStage(
+            [_CollectTiledWorkloadLeaf], **stage_kwargs
+        )
 
         tiled_workload: ComputationNodeWorkload | None = None
         for _, extra in tiled_stage.run():
-            if isinstance(extra, dict) and isinstance(extra.get("workload"), ComputationNodeWorkload):
+            if isinstance(extra, dict) and isinstance(
+                extra.get("workload"), ComputationNodeWorkload
+            ):
                 tiled_workload = extra["workload"]
 
         if tiled_workload is None:
-            raise RuntimeError(f"Failed to retrieve tiled workload for candidate {candidate_idx}.")
+            raise RuntimeError(
+                f"Failed to retrieve tiled workload for candidate {candidate_idx}."
+            )
 
         return tiled_workload, None
 
     def _materialize_candidate_workload(
         self, candidate: dict[int, dict[str, Any]]
     ) -> ONNXWorkload:
-        """Return an ONNX workload where node tilings match the provided candidate."""
         candidate_workload: ONNXWorkload = pickle_deepcopy(self.workload)
         for node in candidate_workload.topological_sort():
             if not isinstance(node, ComputationNode):
@@ -390,22 +436,3 @@ class TilingGeneticOptimizationStage(TilingCombinationEvaluationStage):
             node.intra_core_tiling = list(cfg["intra"])
             node.inter_core_tiling = list(cfg["inter"])
         return candidate_workload
-
-    def _normalize_inter_tiling(
-        self,
-        node: ComputationNode,
-        raw_tiling: list[tuple[Any, Any]],
-    ) -> TILING_WILDCARD_T | TILING_T:
-        """Normalize inter tiling and enforce CO-compatible wildcard form when requested."""
-        tiling = super()._normalize_inter_tiling(node, raw_tiling)
-        if not self.force_inter_wildcard:
-            return tiling
-
-        coerced: TILING_WILDCARD_T = []
-        for dim, factor in tiling:
-            # Keep explicit 1; convert any real split request to wildcard for CO compatibility.
-            if isinstance(factor, int) and factor > 1:
-                coerced.append((dim, "*"))
-            else:
-                coerced.append((dim, factor))
-        return coerced

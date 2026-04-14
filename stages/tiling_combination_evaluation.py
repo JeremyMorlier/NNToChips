@@ -13,7 +13,9 @@ from stream.workload.computation.computation_node import ComputationNode
 from stream.workload.mapping import TILING_T, TILING_WILDCARD_T
 from stream.workload.onnx_workload import ComputationNodeWorkload, ONNXWorkload
 
-from stages.tiled_workload_generation_optimization import TiledWorkloadGenerationStage
+from stream.stages.generation.tiled_workload_generation import (
+    TiledWorkloadGenerationStage,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -28,10 +30,13 @@ class _CollectTiledWorkloadLeaf(Stage):
         return True
 
     def run(self):
-        yield None, {
-            "workload": self.kwargs.get("workload"),
-            "scheduling_order": self.kwargs.get("scheduling_order"),
-        }
+        yield (
+            None,
+            {
+                "workload": self.kwargs.get("workload"),
+                "scheduling_order": self.kwargs.get("scheduling_order"),
+            },
+        )
 
 
 class TilingCombinationEvaluationStage(Stage):
@@ -94,7 +99,9 @@ class TilingCombinationEvaluationStage(Stage):
     def run(self):
         candidates = self._enumerate_candidates(self.workload)
         if not candidates:
-            raise ValueError("No tiling candidates generated. Check intra/inter tiling options.")
+            raise ValueError(
+                "No tiling candidates generated. Check intra/inter tiling options."
+            )
 
         logger.info("Evaluating %d tiling candidate(s).", len(candidates))
 
@@ -148,8 +155,10 @@ class TilingCombinationEvaluationStage(Stage):
             if best_scheduling_order is not None:
                 kwargs["scheduling_order"] = best_scheduling_order
             else:
-                kwargs["scheduling_order"] = TiledWorkloadGenerationStage.get_scheduling_order(
-                    best_tiled_workload
+                kwargs["scheduling_order"] = (
+                    TiledWorkloadGenerationStage.get_scheduling_order(
+                        best_tiled_workload
+                    )
                 )
 
         sub_stage = self.list_of_callables[0](self.list_of_callables[1:], **kwargs)
@@ -168,23 +177,37 @@ class TilingCombinationEvaluationStage(Stage):
             return options[as_str]
         return None
 
-    def _enumerate_candidates(self, workload: ONNXWorkload) -> list[dict[int, dict[str, Any]]]:
-        per_node_choices: list[list[tuple[int, TILING_T, TILING_WILDCARD_T | TILING_T]]] = []
+    def _enumerate_candidates(
+        self, workload: ONNXWorkload
+    ) -> list[dict[int, dict[str, Any]]]:
+        per_node_choices: list[
+            list[tuple[int, TILING_T, TILING_WILDCARD_T | TILING_T]]
+        ] = []
 
         for node in workload.topological_sort():
             if not isinstance(node, ComputationNode):
                 continue
 
-            intra_raw_options = self._lookup_node_options(self.intra_tiling_options, node.id)
-            inter_raw_options = self._lookup_node_options(self.inter_tiling_options, node.id)
+            intra_raw_options = self._lookup_node_options(
+                self.intra_tiling_options, node.id
+            )
+            inter_raw_options = self._lookup_node_options(
+                self.inter_tiling_options, node.id
+            )
 
             intra_options = (
-                [self._normalize_intra_tiling(node, option) for option in intra_raw_options]
+                [
+                    self._normalize_intra_tiling(node, option)
+                    for option in intra_raw_options
+                ]
                 if intra_raw_options
                 else [list(node.intra_core_tiling)]
             )
             inter_options = (
-                [self._normalize_inter_tiling(node, option) for option in inter_raw_options]
+                [
+                    self._normalize_inter_tiling(node, option)
+                    for option in inter_raw_options
+                ]
                 if inter_raw_options
                 else [list(node.inter_core_tiling)]
             )
@@ -239,19 +262,27 @@ class TilingCombinationEvaluationStage(Stage):
             f"tiled_workload_candidate_{candidate_idx}.pickle",
         )
 
-        stage_kwargs = self._build_tiled_stage_kwargs(candidate_workload, candidate_tiled_path)
-        tiled_stage = TiledWorkloadGenerationStage([_CollectTiledWorkloadLeaf], **stage_kwargs)
+        stage_kwargs = self._build_tiled_stage_kwargs(
+            candidate_workload, candidate_tiled_path
+        )
+        tiled_stage = TiledWorkloadGenerationStage(
+            [_CollectTiledWorkloadLeaf], **stage_kwargs
+        )
 
         tiled_workload: ComputationNodeWorkload | None = None
         scheduling_order: Any = None
 
         for _, extra in tiled_stage.run():
-            if isinstance(extra, dict) and isinstance(extra.get("workload"), ComputationNodeWorkload):
+            if isinstance(extra, dict) and isinstance(
+                extra.get("workload"), ComputationNodeWorkload
+            ):
                 tiled_workload = extra["workload"]
                 scheduling_order = extra.get("scheduling_order")
 
         if tiled_workload is None:
-            raise RuntimeError(f"Failed to retrieve tiled workload for candidate {candidate_idx}.")
+            raise RuntimeError(
+                f"Failed to retrieve tiled workload for candidate {candidate_idx}."
+            )
 
         return tiled_workload, scheduling_order
 
@@ -273,7 +304,9 @@ class TilingCombinationEvaluationStage(Stage):
         stage_kwargs["tiled_workload_path"] = tiled_workload_path
         return stage_kwargs
 
-    def _normalize_intra_tiling(self, node: ComputationNode, raw_tiling: RawTiling) -> TILING_T:
+    def _normalize_intra_tiling(
+        self, node: ComputationNode, raw_tiling: RawTiling
+    ) -> TILING_T:
         tiling: TILING_T = []
         for dim_raw, factor_raw in raw_tiling:
             dim = dim_raw if isinstance(dim_raw, LayerDim) else LayerDim(str(dim_raw))
@@ -311,7 +344,9 @@ class TilingCombinationEvaluationStage(Stage):
             tiling.append((dim, factor))
         return tiling
 
-    def _compute_heuristics(self, tiled_workload: ComputationNodeWorkload) -> dict[str, int]:
+    def _compute_heuristics(
+        self, tiled_workload: ComputationNodeWorkload
+    ) -> dict[str, int]:
         num_tiles = len(tiled_workload.node_list)
         edges = list(tiled_workload.edges(data=True))
 
@@ -345,10 +380,14 @@ class TilingCombinationEvaluationStage(Stage):
         )
 
     @staticmethod
-    def _serialize_tiling(tiling: TILING_T | TILING_WILDCARD_T) -> list[tuple[str, int | str]]:
+    def _serialize_tiling(
+        tiling: TILING_T | TILING_WILDCARD_T,
+    ) -> list[tuple[str, int | str]]:
         return [(str(dim), factor) for dim, factor in tiling]
 
-    def _serialize_candidate(self, candidate: dict[int, dict[str, Any]]) -> dict[int, dict[str, Any]]:
+    def _serialize_candidate(
+        self, candidate: dict[int, dict[str, Any]]
+    ) -> dict[int, dict[str, Any]]:
         serialized: dict[int, dict[str, Any]] = {}
         for node_id, cfg in candidate.items():
             serialized[node_id] = {
