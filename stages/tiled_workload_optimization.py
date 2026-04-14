@@ -130,65 +130,36 @@ class TiledWorkloadGenerationStage2(Stage):
         # Memoize the numpy tensors for dependency generation
         self.numpy_tensors: dict[tuple[ComputationNode, LayerOperand], NodeTensor] = {}
         self.tiled_workload_path = tiled_workload_path
+        self.tiling_configurations: list[dict[str, Any]] = list(
+            kwargs.get("tiling_configurations", [])
+        )
+        self.selected_tiling_configuration_index = int(
+            kwargs.get("selected_tiling_configuration_index", 0)
+        )
 
     def run(self):
-        all_unique_tiles: list[ComputationNode] = []
-        # For each node get all the tiles and the edges between them
-        all_tiles: list[ComputationNode] = []
-        all_edges: list[tuple[ComputationNode, ComputationNode, dict[str, int]]] = []
-        for node in self.workload.topological_sort():
-            # If other node types shouldn't be included in tiled workload graph, add here
-            if not isinstance(node, ComputationNode):
-                continue
-            outer_temporal_loops = self.get_outer_tmap_loop_dimensions(node)
-            tiles, unique_tiles = self.get_tiles(node, outer_temporal_loops)
+        candidate_outputs = self._build_tiled_workload_candidates()
+        selected_idx = (
+            self.selected_tiling_configuration_index
+            if self.tiling_configurations
+            else 0
+        )
+        assert 0 <= selected_idx < len(candidate_outputs), (
+            "selected_tiling_configuration_index is out of range. "
+            f"Got {selected_idx} for {len(candidate_outputs)} candidate(s)."
+        )
+        selected_output = candidate_outputs[selected_idx]
+        tiled_workload = selected_output["workload"]
 
-            # Only log once for generated nodes
-            if not isinstance(node, GeneratedComputationNode) or node.gen_id == 0:
-                logger.info(f"{node}: Outer loops {outer_temporal_loops}.")
-                logger.info(f"{node}: Generated {len(tiles)} tile(s).")
-            self.tiles_dict[node] = tiles
-            all_unique_tiles += unique_tiles
-            intra_edges = self.get_intra_edges(tiles)
-            # Add the tiles and intra edges to the lists
-            all_tiles += tiles
-            all_edges += intra_edges
-
-        # Load in cached tiles and reuse cached tiled_workload if they match
-        cached_workload = self.load_cached_tiled_workload()
-        if cached_workload and self.cached_workload_matches(all_tiles, cached_workload):
-            tiled_workload = cached_workload
-            logger.info("Tiled workload loaded from cache.")
-        else:
-            # Get all pairs of nodes that we have to extract inter edges for
-            all_pairs = self.get_all_node_pairs(self.workload)
-            for producer, consumer, is_complex in all_pairs:
-                if is_complex:
-                    inter_edges = self.get_inter_edges_numpy(producer, consumer)
-                else:
-                    inter_edges = self.get_inter_edges_rtree(producer, consumer)
-                all_edges += inter_edges
-
-            # The graph construction needs to happen after the base priority and nb_real_predecessors are set
-            tiled_workload = ComputationNodeWorkload()
-            tiled_workload.add_nodes_from(all_tiles)
-            tiled_workload.add_edges_from(all_edges)
-
-            # Set the base_priority and number of real predecessors of all nodes
-            self.set_base_priority_of_nodes(tiled_workload)
-            self.set_nb_real_predecessors(tiled_workload)
-            tiled_workload = self.remake_workload(all_tiles, all_edges)
-
-            # Save the tiled workload
-            pickle_save(tiled_workload, self.tiled_workload_path)  # type: ignore
-            logger.info(f"Saved tiled workload to {self.tiled_workload_path}.")
-
+        logger.info(
+            "Selected tiled workload configuration %d/%d%s",
+            selected_idx,
+            len(candidate_outputs),
+            f" ({selected_output['name']})" if selected_output["name"] else "",
+        )
         logger.info(f"Finer graph: {tiled_workload}.")
         sink_constraint_ok, invalid_stacks = self._check_sink_nodes_constraint(
             tiled_workload
-        )
-        logger.warning(
-            f"Sink constraint ok: {sink_constraint_ok}, Invalid stacks: {invalid_stacks}"
         )
         assert sink_constraint_ok, (
             "Expected exactly one sink layer per layer stack. "
@@ -199,6 +170,9 @@ class TiledWorkloadGenerationStage2(Stage):
         kwargs["original_workload"] = pickle_deepcopy(self.workload)
         kwargs["workload"] = tiled_workload
         kwargs["accelerator"] = self.accelerator
+        kwargs["tiled_workload_candidates"] = candidate_outputs
+        kwargs["selected_tiling_configuration_index"] = selected_idx
+        kwargs["selected_tiling_configuration"] = selected_output["configuration"]
 
         if "scheduling_order" not in kwargs:
             kwargs["scheduling_order"] = self.get_scheduling_order(tiled_workload)
@@ -206,6 +180,162 @@ class TiledWorkloadGenerationStage2(Stage):
         yield from sub_stage.run()
 
         yield None, None
+
+    def _build_tiled_workload_candidates(self) -> list[dict[str, Any]]:
+        if not self.tiling_configurations:
+            tiled_workload = self._generate_tiled_workload_for_workload(
+                self.workload,
+                self.tiled_workload_path,
+            )
+            return [
+                {
+                    "index": 0,
+                    "name": None,
+                    "configuration": None,
+                    "workload": tiled_workload,
+                }
+            ]
+
+        candidates: list[dict[str, Any]] = []
+        for idx, configuration in enumerate(self.tiling_configurations):
+            configured_workload = self._materialize_workload_for_configuration(
+                configuration
+            )
+            candidate_tiled_path = self._get_tiled_workload_path_for_configuration(idx)
+            tiled_workload = self._generate_tiled_workload_for_workload(
+                configured_workload,
+                candidate_tiled_path,
+            )
+            config_name = configuration.get("name") if isinstance(configuration, dict) else None
+            candidates.append(
+                {
+                    "index": idx,
+                    "name": config_name,
+                    "configuration": configuration,
+                    "workload": tiled_workload,
+                }
+            )
+            logger.info("Built tiled workload candidate %d%s.", idx, f" ({config_name})" if config_name else "")
+
+        return candidates
+
+    def _generate_tiled_workload_for_workload(
+        self,
+        workload: ONNXWorkload,
+        tiled_workload_path: str,
+    ) -> ComputationNodeWorkload:
+        original_workload = self.workload
+        original_tiled_workload_path = self.tiled_workload_path
+        original_tiles_dict = self.tiles_dict
+        original_numpy_tensors = self.numpy_tensors
+
+        self.workload = workload
+        self.tiled_workload_path = tiled_workload_path
+        self.tiles_dict = {}
+        self.numpy_tensors = {}
+
+        try:
+            all_tiles: list[ComputationNode] = []
+            all_edges: list[tuple[ComputationNode, ComputationNode, dict[str, int]]] = []
+            for node in self.workload.topological_sort():
+                if not isinstance(node, ComputationNode):
+                    continue
+                outer_temporal_loops = self.get_outer_tmap_loop_dimensions(node)
+                tiles, _ = self.get_tiles(node, outer_temporal_loops)
+
+                if not isinstance(node, GeneratedComputationNode) or node.gen_id == 0:
+                    logger.info(f"{node}: Outer loops {outer_temporal_loops}.")
+                    logger.info(f"{node}: Generated {len(tiles)} tile(s).")
+                self.tiles_dict[node] = tiles
+                intra_edges = self.get_intra_edges(tiles)
+                all_tiles += tiles
+                all_edges += intra_edges
+
+            cached_workload = self.load_cached_tiled_workload()
+            if cached_workload and self.cached_workload_matches(all_tiles, cached_workload):
+                tiled_workload = cached_workload
+                logger.info("Tiled workload loaded from cache.")
+            else:
+                all_pairs = self.get_all_node_pairs(self.workload)
+                for producer, consumer, is_complex in all_pairs:
+                    if is_complex:
+                        inter_edges = self.get_inter_edges_numpy(producer, consumer)
+                    else:
+                        inter_edges = self.get_inter_edges_rtree(producer, consumer)
+                    all_edges += inter_edges
+
+                tiled_workload = ComputationNodeWorkload()
+                tiled_workload.add_nodes_from(all_tiles)
+                tiled_workload.add_edges_from(all_edges)
+
+                self.set_base_priority_of_nodes(tiled_workload)
+                self.set_nb_real_predecessors(tiled_workload)
+                tiled_workload = self.remake_workload(all_tiles, all_edges)
+
+                pickle_save(tiled_workload, self.tiled_workload_path)  # type: ignore
+                logger.info(f"Saved tiled workload to {self.tiled_workload_path}.")
+            return tiled_workload
+        finally:
+            self.workload = original_workload
+            self.tiled_workload_path = original_tiled_workload_path
+            self.tiles_dict = original_tiles_dict
+            self.numpy_tensors = original_numpy_tensors
+
+    def _materialize_workload_for_configuration(
+        self, configuration: dict[str, Any]
+    ) -> ONNXWorkload:
+        configured_workload: ONNXWorkload = pickle_deepcopy(self.workload)
+        node_tilings = self._extract_node_tilings(configuration)
+        for node in configured_workload.topological_sort():
+            if not isinstance(node, ComputationNode):
+                continue
+            cfg = self._lookup_node_configuration(node_tilings, node.id)
+            if cfg is None:
+                continue
+
+            intra_raw = cfg.get("intra", cfg.get("intra_core_tiling"))
+            inter_raw = cfg.get("inter", cfg.get("inter_core_tiling"))
+            if intra_raw is not None:
+                node.intra_core_tiling = self._normalize_manual_tiling_entries(
+                    intra_raw, allow_wildcard=False
+                )
+            if inter_raw is not None:
+                node.inter_core_tiling = self._normalize_manual_tiling_entries(
+                    inter_raw, allow_wildcard=True
+                )
+        return configured_workload
+
+    def _extract_node_tilings(self, configuration: dict[str, Any]) -> dict[Any, Any]:
+        node_tilings = configuration.get("node_tilings")
+        if isinstance(node_tilings, dict):
+            return node_tilings
+        return configuration
+
+    def _lookup_node_configuration(self, node_tilings: dict[Any, Any], node_id: int):
+        if node_id in node_tilings:
+            return node_tilings[node_id]
+        node_id_str = str(node_id)
+        if node_id_str in node_tilings:
+            return node_tilings[node_id_str]
+        return None
+
+    def _normalize_manual_tiling_entries(
+        self, raw_tiling: list[tuple[LayerDim | str, int | str]], allow_wildcard: bool
+    ) -> list[tuple[LayerDim, int | str]]:
+        normalized: list[tuple[LayerDim, int | str]] = []
+        for dim_raw, factor_raw in raw_tiling:
+            dim = dim_raw if isinstance(dim_raw, LayerDim) else LayerDim(str(dim_raw))
+            if allow_wildcard and factor_raw in {"*", "all"}:
+                factor: int | str = factor_raw
+            else:
+                factor = int(factor_raw)
+            normalized.append((dim, factor))
+        return normalized
+
+    def _get_tiled_workload_path_for_configuration(self, config_idx: int) -> str:
+        base, ext = os.path.splitext(self.tiled_workload_path)
+        extension = ext if ext else ".pickle"
+        return f"{base}_config_{config_idx}{extension}"
 
     def _check_sink_nodes_constraint(
         self, workload: ComputationNodeWorkload

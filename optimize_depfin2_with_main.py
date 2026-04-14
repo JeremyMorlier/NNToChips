@@ -38,12 +38,58 @@ def parse_args():
         default=2,
         help="Hardware GA generations.",
     )
+    parser.add_argument(
+        "--tiling-config-index",
+        type=int,
+        default=0,
+        help="Index of the manual tiling configuration to select.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
 
 
 def build_depfin2_layer_stacks() -> list[tuple[int, ...]]:
     return [tuple(range(0, 12)), tuple(range(12, 22))] + [(i,) for i in range(22, 49)]
+
+
+def build_manual_tiling_configurations() -> list[dict]:
+    """Manual tiling candidates for TiledWorkloadGenerationStage2."""
+    return [
+        {
+            "name": "cfg0_balanced",
+            "node_tilings": {
+                0: {
+                    "intra": [("K", 4), ("OY", 4)],
+                    "inter": [("K", "*")],
+                },
+                1: {
+                    "intra": [("K", 3), ("OY", 8)],
+                    "inter": [("K", "*")],
+                },
+                2: {
+                    "intra": [("K", 3), ("OY", 4)],
+                    "inter": [("K", "*")],
+                },
+            },
+        },
+        {
+            "name": "cfg1_output_heavy",
+            "node_tilings": {
+                0: {
+                    "intra": [("K", 8), ("OY", 2)],
+                    "inter": [("K", "*")],
+                },
+                1: {
+                    "intra": [("K", 4), ("OY", 4)],
+                    "inter": [("K", "*")],
+                },
+                2: {
+                    "intra": [("K", 2), ("OY", 8)],
+                    "inter": [("K", "*")],
+                },
+            },
+        },
+    ]
 
 
 def prepare_local_hardware_assets(run_dir: Path, depfin2_hw_dir: Path) -> None:
@@ -128,6 +174,7 @@ def main():
         {"name": "d1_size", "lower": 64, "upper": 256, "scale": 1},
         {"name": "d2_size", "lower": 8, "upper": 32, "scale": 1},
     ]
+    tiling_configurations = build_manual_tiling_configurations()
 
     logging.info("Starting optimize_single_hardware_co depfin2 flow")
     scme = optimize_single_hardware_co(
@@ -146,6 +193,8 @@ def main():
         hardware_ga_generations=args.generations,
         hardware_ga_population=args.pop_size,
         hardware_ga_seed=args.seed,
+        tiling_configurations=tiling_configurations,
+        selected_tiling_configuration_index=args.tiling_config_index,
     )
 
     summary = {
@@ -158,6 +207,8 @@ def main():
         "ga_population": args.pop_size,
         "ga_generations": args.generations,
         "ga_seed": args.seed,
+        "selected_tiling_configuration_index": args.tiling_config_index,
+        "tiling_configuration_names": [cfg["name"] for cfg in tiling_configurations],
     }
 
     summary_path = run_dir / "main_stage2_summary.json"

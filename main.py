@@ -99,8 +99,10 @@ def optimize_single_hardware_co(  # noqa: PLR0913
     hardware_ga_population: int = 8,
     hardware_ga_seed: int = 42,
     hardware_ga_workers: int | None = None,
-    intra_tiling_options: dict[int | str, list[list[tuple[str, int | str]]]] | None = None,
-    inter_tiling_options: dict[int | str, list[list[tuple[str, int | str]]]] | None = None,
+    intra_tiling_options: dict[int | str, list[list[tuple[str, int | str]]]]
+    | None = None,
+    inter_tiling_options: dict[int | str, list[list[tuple[str, int | str]]]]
+    | None = None,
     tiling_ga_generations: int = 6,
     tiling_ga_population: int = 24,
     tiling_ga_seed: int = 42,
@@ -109,6 +111,8 @@ def optimize_single_hardware_co(  # noqa: PLR0913
     tiling_weight_edges: float = 1.0,
     tiling_weight_inter_edges: float = 2.0,
     tiling_weight_inter_bits: float = 1e-6,
+    tiling_configurations: list[dict] | None = None,
+    selected_tiling_configuration_index: int = 0,
 ) -> StreamCostModelEvaluation:
     _sanity_check_inputs(hardware_template, workload, mode, output_path)
     _sanity_check_gurobi_license()
@@ -151,9 +155,9 @@ def optimize_single_hardware_co(  # noqa: PLR0913
                 TilingGenerationStage,
                 TiledWorkloadGenerationStage2,
                 LayerStacksGenerationStage,
-                GeneticHardwareStage,
-                ZigZagCoreMappingEstimationStage,
-                ConstraintOptimizationAllocationStage,
+                # GeneticHardwareStage,
+                # ZigZagCoreMappingEstimationStage,
+                # ConstraintOptimizationAllocationStage,
             ],
             accelerator=hardware_template,
             hardware_template=hardware_template,
@@ -187,6 +191,8 @@ def optimize_single_hardware_co(  # noqa: PLR0913
             tiling_weight_edges=tiling_weight_edges,
             tiling_weight_inter_edges=tiling_weight_inter_edges,
             tiling_weight_inter_bits=tiling_weight_inter_bits,
+            tiling_configurations=tiling_configurations or [],
+            selected_tiling_configuration_index=selected_tiling_configuration_index,
         )
         # Launch the MainStage
         answers = mainstage.run()
@@ -214,8 +220,10 @@ def optimize_single_hardware_co_with_mapping(  # noqa: PLR0913
     hardware_ga_population: int = 8,
     hardware_ga_seed: int = 42,
     hardware_ga_workers: int | None = None,
-    intra_tiling_options: dict[int | str, list[list[tuple[str, int | str]]]] | None = None,
-    inter_tiling_options: dict[int | str, list[list[tuple[str, int | str]]]] | None = None,
+    intra_tiling_options: dict[int | str, list[list[tuple[str, int | str]]]]
+    | None = None,
+    inter_tiling_options: dict[int | str, list[list[tuple[str, int | str]]]]
+    | None = None,
     tiling_ga_generations: int = 6,
     tiling_ga_population: int = 24,
     tiling_ga_seed: int = 42,
