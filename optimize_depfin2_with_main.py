@@ -44,6 +44,31 @@ def parse_args():
         default=0,
         help="Index of the manual tiling configuration to select.",
     )
+    parser.add_argument(
+        "--tiling-config-optimizer",
+        type=str,
+        choices=["manual", "ga"],
+        default="manual",
+        help="How to choose tiling configurations.",
+    )
+    parser.add_argument(
+        "--tiling-config-ga-generations",
+        type=int,
+        default=6,
+        help="Generations for tiling-configuration GA.",
+    )
+    parser.add_argument(
+        "--tiling-config-ga-population",
+        type=int,
+        default=24,
+        help="Population for tiling-configuration GA.",
+    )
+    parser.add_argument(
+        "--max-tiles-per-node",
+        type=int,
+        default=10_000,
+        help="Maximum allowed tiles per node (intra_factor * inter_factor).",
+    )
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
 
@@ -59,8 +84,8 @@ def build_manual_tiling_configurations() -> list[dict]:
             "name": "cfg0_balanced",
             "node_tilings": {
                 0: {
-                    "intra": [("K", 4), ("OY", 4)],
-                    "inter": [("K", "*")],
+                    "intra": [("K", 2), ("OX", 540), ("OY", 4)],
+                    "inter": [("K", 1)],
                 },
                 1: {
                     "intra": [("K", 3), ("OY", 8)],
@@ -224,6 +249,11 @@ def main():
         hardware_ga_seed=args.seed,
         tiling_configurations=tiling_configurations,
         selected_tiling_configuration_index=args.tiling_config_index,
+        tiling_configuration_optimization_method=args.tiling_config_optimizer,
+        tiling_config_ga_generations=args.tiling_config_ga_generations,
+        tiling_config_ga_population=args.tiling_config_ga_population,
+        tiling_config_ga_seed=args.seed,
+        max_tiles_per_node=args.max_tiles_per_node,
     )
 
     summary = {
@@ -237,6 +267,10 @@ def main():
         "ga_generations": args.generations,
         "ga_seed": args.seed,
         "selected_tiling_configuration_index": args.tiling_config_index,
+        "tiling_configuration_optimization_method": args.tiling_config_optimizer,
+        "tiling_config_ga_generations": args.tiling_config_ga_generations,
+        "tiling_config_ga_population": args.tiling_config_ga_population,
+        "max_tiles_per_node": args.max_tiles_per_node,
         "tiling_configuration_names": [cfg["name"] for cfg in tiling_configurations],
     }
 

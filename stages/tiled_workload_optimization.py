@@ -1,11 +1,17 @@
 import logging
 import os
+import tempfile
 import time
 from collections import defaultdict
 from copy import deepcopy
+from dataclasses import dataclass
 from math import ceil, prod
-from typing import Any
+from typing import Any, Literal
 
+import numpy as np
+from pymoo.algorithms.moo.nsga2 import NSGA2
+from pymoo.core.problem import Problem
+from pymoo.optimize import minimize
 from rtree import index
 from zigzag.datatypes import Constants, LayerDim, LayerOperand
 from zigzag.utils import pickle_deepcopy, pickle_load, pickle_save
@@ -30,7 +36,6 @@ from stream.workload.dnn_workload import DNNWorkloadStream
 from stream.workload.node import Node
 from stream.workload.onnx_workload import ComputationNodeWorkload, ONNXWorkload
 from stream.workload.tensor import Tensor
-from stream.workload.utils import get_real_successors
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +107,56 @@ class TensorDimensionMismatchError(Exception):
     """Facilitates error handling in case incorrect tensor dimensions are passed on"""
 
 
+@dataclass(frozen=True)
+class TilingFactorVar:
+    node_id: int
+    kind: Literal["intra", "inter"]
+    layer_dim: LayerDim
+    factors: tuple[int, ...]
+
+
+class _FusionHeuristicTilingProblem(Problem):
+    def __init__(
+        self, stage: "TiledWorkloadGenerationStage2", var_specs: list[TilingFactorVar]
+    ):
+        self.stage = stage
+        self.var_specs = var_specs
+        self.best_score = float("-inf")
+        self.best_vector: tuple[int, ...] | None = None
+        super().__init__(
+            n_var=len(var_specs),
+            n_obj=1,  # minimize negative fusion score
+            n_constr=1,  # validity constraint
+            xl=np.zeros(len(var_specs), dtype=int),
+            xu=np.array([len(v.factors) - 1 for v in var_specs], dtype=int),
+            vtype=int,
+            elementwise_evaluation=False,
+        )
+
+    def _evaluate(self, X: np.ndarray, out: dict[str, Any], *args: Any, **kwargs: Any):
+        f_rows: list[list[float]] = []
+        g_rows: list[list[float]] = []
+        for x in X:
+            vector = tuple(int(v) for v in np.asarray(x, dtype=int).tolist())
+            evaluation = self.stage._evaluate_tiling_ga_vector(vector)
+            score = float(evaluation["score"])
+            valid = bool(evaluation["valid"])
+
+            if valid and score > self.best_score:
+                self.best_score = score
+                self.best_vector = vector
+
+            if valid:
+                f_rows.append([-score])
+                g_rows.append([0.0])
+            else:
+                f_rows.append([1e12])
+                g_rows.append([1.0])
+
+        out["F"] = np.asarray(f_rows, dtype=float)
+        out["G"] = np.asarray(g_rows, dtype=float)
+
+
 class TiledWorkloadGenerationStage2(Stage):
     """
     Class that transforms the layer-by-layer workload into tiled workload graph.
@@ -139,6 +194,28 @@ class TiledWorkloadGenerationStage2(Stage):
         self.tiling_selection_goal = str(
             kwargs.get("tiling_selection_goal", "fusion_heuristic")
         )
+        self.max_tiles_per_node = int(kwargs.get("max_tiles_per_node", 10_000))
+        self.tiling_configuration_optimization_method = str(
+            kwargs.get("tiling_configuration_optimization_method", "manual")
+        )
+        self.tiling_config_ga_generations = int(
+            kwargs.get(
+                "tiling_config_ga_generations", kwargs.get("tiling_ga_generations", 6)
+            )
+        )
+        self.tiling_config_ga_population = int(
+            kwargs.get(
+                "tiling_config_ga_population", kwargs.get("tiling_ga_population", 24)
+            )
+        )
+        self.tiling_config_ga_seed = int(
+            kwargs.get("tiling_config_ga_seed", kwargs.get("tiling_ga_seed", 42))
+        )
+        self._ga_var_specs: list[TilingFactorVar] = []
+        self._ga_base_candidate: dict[int, dict[str, Any]] = {}
+        self._ga_eval_cache: dict[tuple[int, ...], dict[str, Any]] = {}
+        self._ga_next_candidate_index = 0
+        self._ga_tmp_dir = "/tmp"
 
     def run(self):
         candidate_outputs = self._build_tiled_workload_candidates()
@@ -158,13 +235,6 @@ class TiledWorkloadGenerationStage2(Stage):
             f" ({selected_output['name']})" if selected_output["name"] else "",
         )
         logger.info(f"Finer graph: {tiled_workload}.")
-        sink_constraint_ok, invalid_stacks = self._check_sink_nodes_constraint(
-            tiled_workload
-        )
-        assert sink_constraint_ok, (
-            "Expected exactly one sink layer per layer stack. "
-            f"Invalid stacks: {invalid_stacks}. Update your layer stacks."
-        )
 
         kwargs = self.kwargs.copy()
         kwargs["original_workload"] = pickle_deepcopy(self.workload)
@@ -183,7 +253,7 @@ class TiledWorkloadGenerationStage2(Stage):
         yield None, None
 
     def _select_candidate_index(self, candidates: list[dict[str, Any]]) -> int:
-        if not self.tiling_configurations:
+        if len(candidates) == 1:
             return 0
 
         if self.tiling_selection_goal == "manual_index":
@@ -209,14 +279,7 @@ class TiledWorkloadGenerationStage2(Stage):
     ) -> list[dict[str, Any]]:
         for candidate in candidates:
             workload = candidate["workload"]
-            sink_constraint_ok, invalid_stacks = self._check_sink_nodes_constraint(
-                workload
-            )
             heuristics = self._compute_fusion_heuristics(workload)
-            heuristics["sink_constraint_ok"] = sink_constraint_ok
-            heuristics["invalid_stacks"] = invalid_stacks
-            if not sink_constraint_ok:
-                heuristics["fusion_score"] = float("-inf")
             candidate["heuristics"] = heuristics
         return candidates
 
@@ -282,7 +345,17 @@ class TiledWorkloadGenerationStage2(Stage):
         }
 
     def _build_tiled_workload_candidates(self) -> list[dict[str, Any]]:
+        if self.tiling_configuration_optimization_method == "ga":
+            return self._build_tiled_workload_candidates_via_ga()
+
         if not self.tiling_configurations:
+            tile_limit_ok, tile_limit_violations = self._check_max_tiles_per_node(
+                self.workload
+            )
+            assert tile_limit_ok, (
+                f"Current workload violates max_tiles_per_node={self.max_tiles_per_node}. "
+                f"Violations (node_id, tile_count): {tile_limit_violations}"
+            )
             tiled_workload = self._generate_tiled_workload_for_workload(
                 self.workload,
                 self.tiled_workload_path,
@@ -301,12 +374,26 @@ class TiledWorkloadGenerationStage2(Stage):
             configured_workload = self._materialize_workload_for_configuration(
                 configuration
             )
+            tile_limit_ok, tile_limit_violations = self._check_max_tiles_per_node(
+                configured_workload
+            )
+            if not tile_limit_ok:
+                logger.warning(
+                    "Rejected tiling configuration %d due to max_tiles_per_node=%d. "
+                    "Violations (node_id, tile_count): %s",
+                    idx,
+                    self.max_tiles_per_node,
+                    tile_limit_violations,
+                )
+                continue
             candidate_tiled_path = self._get_tiled_workload_path_for_configuration(idx)
             tiled_workload = self._generate_tiled_workload_for_workload(
                 configured_workload,
                 candidate_tiled_path,
             )
-            config_name = configuration.get("name") if isinstance(configuration, dict) else None
+            config_name = (
+                configuration.get("name") if isinstance(configuration, dict) else None
+            )
             candidates.append(
                 {
                     "index": idx,
@@ -315,9 +402,216 @@ class TiledWorkloadGenerationStage2(Stage):
                     "workload": tiled_workload,
                 }
             )
-            logger.info("Built tiled workload candidate %d%s.", idx, f" ({config_name})" if config_name else "")
+            logger.info(
+                "Built tiled workload candidate %d%s.",
+                idx,
+                f" ({config_name})" if config_name else "",
+            )
 
+        assert candidates, (
+            "No valid tiling configuration remains after max_tiles_per_node filtering."
+        )
         return candidates
+
+    def _build_tiled_workload_candidates_via_ga(self) -> list[dict[str, Any]]:
+        self._prepare_tiling_ga_search_space(self.workload)
+        if not self._ga_var_specs:
+            logger.info(
+                "No GA tiling variables found; falling back to current tiling configuration."
+            )
+            tiled_workload = self._generate_tiled_workload_for_workload(
+                self.workload, self.tiled_workload_path
+            )
+            return [
+                {
+                    "index": 0,
+                    "name": "ga_fallback_current",
+                    "configuration": None,
+                    "workload": tiled_workload,
+                }
+            ]
+
+        logger.info(
+            "Starting tiling-configuration GA: vars=%d, pop=%d, generations=%d",
+            len(self._ga_var_specs),
+            self.tiling_config_ga_population,
+            self.tiling_config_ga_generations,
+        )
+
+        with tempfile.TemporaryDirectory(prefix="tiling_cfg_ga_") as tmp_dir:
+            self._ga_tmp_dir = tmp_dir
+            problem = _FusionHeuristicTilingProblem(self, self._ga_var_specs)
+            algorithm = NSGA2(pop_size=self.tiling_config_ga_population)
+            minimize(
+                problem,
+                algorithm,
+                termination=("n_gen", self.tiling_config_ga_generations),
+                seed=self.tiling_config_ga_seed,
+                verbose=False,
+            )
+
+        candidates = sorted(
+            (
+                c
+                for c in self._ga_eval_cache.values()
+                if c.get("workload") is not None
+            ),
+            key=lambda c: int(c["index"]),
+        )
+        assert candidates, "Tiling GA produced no candidates."
+        logger.info(
+            "Tiling-configuration GA completed with %d evaluated candidate(s).",
+            len(candidates),
+        )
+        return candidates
+
+    def _prepare_tiling_ga_search_space(self, workload: ONNXWorkload) -> None:
+        self._ga_var_specs.clear()
+        self._ga_base_candidate.clear()
+        self._ga_eval_cache.clear()
+        self._ga_next_candidate_index = 0
+
+        for node in workload.topological_sort():
+            if not isinstance(node, ComputationNode):
+                continue
+
+            self._ga_base_candidate[node.id] = {
+                "intra": list(node.intra_core_tiling),
+                "inter": list(node.inter_core_tiling),
+            }
+
+            for dim, dim_size in node.layer_dim_sizes.items():
+                if dim == LayerDim("B") or int(dim_size) <= 1:
+                    continue
+                factors = self._integer_factor_options(int(dim_size))
+                if len(factors) <= 1:
+                    continue
+                self._ga_var_specs.append(
+                    TilingFactorVar(
+                        node_id=node.id,
+                        kind="intra",
+                        layer_dim=dim,
+                        factors=factors,
+                    )
+                )
+
+            inter_dim = self._get_inter_dim_for_node(node)
+            if inter_dim is not None:
+                inter_size = int(node.layer_dim_sizes[inter_dim])
+                factors = self._integer_factor_options(inter_size)
+                if len(factors) > 1:
+                    self._ga_var_specs.append(
+                        TilingFactorVar(
+                            node_id=node.id,
+                            kind="inter",
+                            layer_dim=inter_dim,
+                            factors=factors,
+                        )
+                    )
+
+    @staticmethod
+    def _integer_factor_options(n: int) -> tuple[int, ...]:
+        factors: set[int] = set()
+        for i in range(1, int(n**0.5) + 1):
+            if n % i == 0:
+                factors.add(i)
+                factors.add(n // i)
+        sorted_factors = tuple(sorted(factors))
+        assert sorted_factors and sorted_factors[0] == 1, (
+            f"Invalid factor options for n={n}. Minimum factor must be 1."
+        )
+        return sorted_factors
+
+    def _get_inter_dim_for_node(self, node: ComputationNode) -> LayerDim | None:
+        if node.inter_core_tiling:
+            return node.inter_core_tiling[0][0]
+        for dim, dim_size in node.layer_dim_sizes.items():
+            if dim != LayerDim("B") and int(dim_size) > 1:
+                return dim
+        return None
+
+    def _decode_tiling_ga_vector(self, vector: tuple[int, ...]) -> dict[str, Any]:
+        node_tilings: dict[int, dict[str, Any]] = {}
+        for node_id, cfg in self._ga_base_candidate.items():
+            node_tilings[node_id] = {
+                "intra": list(cfg["intra"]),
+                "inter": list(cfg["inter"]),
+            }
+
+        intra_maps: dict[int, dict[LayerDim, int]] = defaultdict(dict)
+        inter_maps: dict[int, tuple[LayerDim, int]] = {}
+        for idx, spec in enumerate(self._ga_var_specs):
+            factor = int(spec.factors[int(vector[idx])])
+            if spec.kind == "intra":
+                if factor > 1:
+                    intra_maps[spec.node_id][spec.layer_dim] = factor
+            else:
+                inter_maps[spec.node_id] = (spec.layer_dim, factor)
+
+        for node_id, dims_to_factors in intra_maps.items():
+            node_tilings[node_id]["intra"] = list(dims_to_factors.items())
+        for node_id, inter_entry in inter_maps.items():
+            node_tilings[node_id]["inter"] = [inter_entry]
+
+        return {
+            "name": f"ga_vector_{'_'.join(str(v) for v in vector)}",
+            "node_tilings": node_tilings,
+        }
+
+    def _evaluate_tiling_ga_vector(self, vector: tuple[int, ...]) -> dict[str, Any]:
+        if vector in self._ga_eval_cache:
+            return self._ga_eval_cache[vector]
+
+        configuration = self._decode_tiling_ga_vector(vector)
+        candidate_index = self._ga_next_candidate_index
+        self._ga_next_candidate_index += 1
+
+        configured_workload = self._materialize_workload_for_configuration(
+            configuration
+        )
+        tile_limit_ok, tile_limit_violations = self._check_max_tiles_per_node(
+            configured_workload
+        )
+        if not tile_limit_ok:
+            evaluation = {
+                "index": candidate_index,
+                "name": configuration.get("name", f"ga_candidate_{candidate_index}"),
+                "configuration": configuration,
+                "workload": None,
+                "heuristics": {
+                    "fusion_score": float("-inf"),
+                    "tile_limit_ok": False,
+                    "tile_limit_violations": tile_limit_violations,
+                },
+                "score": float("-inf"),
+                "valid": False,
+            }
+            self._ga_eval_cache[vector] = evaluation
+            return evaluation
+
+        candidate_tiled_path = os.path.join(
+            self._ga_tmp_dir, f"tiled_workload_ga_candidate_{candidate_index}.pickle"
+        )
+        tiled_workload = self._generate_tiled_workload_for_workload(
+            configured_workload, candidate_tiled_path
+        )
+        heuristics = self._compute_fusion_heuristics(tiled_workload)
+
+        heuristics["tile_limit_ok"] = True
+        heuristics["tile_limit_violations"] = []
+
+        score = float(heuristics["fusion_score"])
+        evaluation = {
+            "index": candidate_index,
+            "name": configuration.get("name", f"ga_candidate_{candidate_index}"),
+            "configuration": configuration,
+            "workload": tiled_workload,
+            "heuristics": heuristics,
+            "score": score,
+            "valid": True,
+        }
+        self._ga_eval_cache[vector] = evaluation
+        return evaluation
 
     def _generate_tiled_workload_for_workload(
         self,
@@ -336,10 +630,13 @@ class TiledWorkloadGenerationStage2(Stage):
 
         try:
             all_tiles: list[ComputationNode] = []
-            all_edges: list[tuple[ComputationNode, ComputationNode, dict[str, int]]] = []
+            all_edges: list[
+                tuple[ComputationNode, ComputationNode, dict[str, int]]
+            ] = []
             for node in self.workload.topological_sort():
                 if not isinstance(node, ComputationNode):
                     continue
+
                 outer_temporal_loops = self.get_outer_tmap_loop_dimensions(node)
                 tiles, _ = self.get_tiles(node, outer_temporal_loops)
 
@@ -352,7 +649,9 @@ class TiledWorkloadGenerationStage2(Stage):
                 all_edges += intra_edges
 
             cached_workload = self.load_cached_tiled_workload()
-            if cached_workload and self.cached_workload_matches(all_tiles, cached_workload):
+            if cached_workload and self.cached_workload_matches(
+                all_tiles, cached_workload
+            ):
                 tiled_workload = cached_workload
                 logger.info("Tiled workload loaded from cache.")
             else:
@@ -411,6 +710,37 @@ class TiledWorkloadGenerationStage2(Stage):
             return node_tilings
         return configuration
 
+    def _check_max_tiles_per_node(
+        self, workload: ONNXWorkload
+    ) -> tuple[bool, list[tuple[int, int]]]:
+        violations: list[tuple[int, int]] = []
+        for node in workload.topological_sort():
+            if not isinstance(node, ComputationNode):
+                continue
+            intra_factor = self._tiling_factor_product(node.intra_core_tiling)
+            inter_factor = self._tiling_factor_product(
+                node.inter_core_tiling, wildcard_as_one=True
+            )
+            tile_count = int(intra_factor * inter_factor)
+            if tile_count > self.max_tiles_per_node:
+                violations.append((int(node.id), tile_count))
+        return (len(violations) == 0), violations
+
+    @staticmethod
+    def _tiling_factor_product(
+        tiling: list[tuple[LayerDim, int | str]],
+        wildcard_as_one: bool = False,
+    ) -> int:
+        factor = 1
+        for _, split in tiling:
+            if isinstance(split, int):
+                factor *= max(1, split)
+                continue
+            if wildcard_as_one and split in {"*", "all"}:
+                continue
+            raise ValueError(f"Unsupported non-integer tiling factor: {split}")
+        return factor
+
     def _lookup_node_configuration(self, node_tilings: dict[Any, Any], node_id: int):
         if node_id in node_tilings:
             return node_tilings[node_id]
@@ -429,6 +759,10 @@ class TiledWorkloadGenerationStage2(Stage):
                 factor: int | str = factor_raw
             else:
                 factor = int(factor_raw)
+                if factor < 1:
+                    raise ValueError(
+                        f"Invalid tiling factor {factor} for dimension {dim}. Minimum value is 1."
+                    )
             normalized.append((dim, factor))
         return normalized
 
@@ -436,34 +770,6 @@ class TiledWorkloadGenerationStage2(Stage):
         base, ext = os.path.splitext(self.tiled_workload_path)
         extension = ext if ext else ".pickle"
         return f"{base}_config_{config_idx}{extension}"
-
-    def _check_sink_nodes_constraint(
-        self, workload: ComputationNodeWorkload
-    ) -> tuple[bool, list[tuple[int, tuple[int, ...], list[int]]]]:
-        sink_constraint_ok = True
-        invalid_stacks: list[tuple[int, tuple[int, ...], list[int]]] = []
-
-        if not self.layer_stacks:
-            return sink_constraint_ok, invalid_stacks
-
-        for stack_idx, stack in enumerate(self.layer_stacks):
-            nodes = [n for n in workload.node_list if n.id in stack]
-            if not nodes:
-                logger.warning(f"Stack {stack_idx} is empty.")
-                continue
-
-            sg = workload.get_subgraph(nodes)
-            sink_nodes = [
-                n
-                for n in sg.nodes()
-                if len(get_real_successors(n, sg)) == 0  # type: ignore[arg-type]
-            ]
-            sink_layer_ids = sorted(set(n.id for n in sink_nodes))
-            if len(sink_layer_ids) != 1:
-                sink_constraint_ok = False
-                invalid_stacks.append((stack_idx, stack, sink_layer_ids))
-
-        return sink_constraint_ok, invalid_stacks
 
     def cached_workload_matches(
         self, tiles: list[ComputationNode], cached_tiles: ComputationNodeWorkload
