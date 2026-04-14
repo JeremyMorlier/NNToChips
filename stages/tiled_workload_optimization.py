@@ -30,6 +30,7 @@ from stream.workload.dnn_workload import DNNWorkloadStream
 from stream.workload.node import Node
 from stream.workload.onnx_workload import ComputationNodeWorkload, ONNXWorkload
 from stream.workload.tensor import Tensor
+from stream.workload.utils import get_real_successors
 
 logger = logging.getLogger(__name__)
 
@@ -183,6 +184,16 @@ class TiledWorkloadGenerationStage2(Stage):
             logger.info(f"Saved tiled workload to {self.tiled_workload_path}.")
 
         logger.info(f"Finer graph: {tiled_workload}.")
+        sink_constraint_ok, invalid_stacks = self._check_sink_nodes_constraint(
+            tiled_workload
+        )
+        logger.warning(
+            f"Sink constraint ok: {sink_constraint_ok}, Invalid stacks: {invalid_stacks}"
+        )
+        assert sink_constraint_ok, (
+            "Expected exactly one sink layer per layer stack. "
+            f"Invalid stacks: {invalid_stacks}. Update your layer stacks."
+        )
 
         kwargs = self.kwargs.copy()
         kwargs["original_workload"] = pickle_deepcopy(self.workload)
@@ -195,6 +206,34 @@ class TiledWorkloadGenerationStage2(Stage):
         yield from sub_stage.run()
 
         yield None, None
+
+    def _check_sink_nodes_constraint(
+        self, workload: ComputationNodeWorkload
+    ) -> tuple[bool, list[tuple[int, tuple[int, ...], list[int]]]]:
+        sink_constraint_ok = True
+        invalid_stacks: list[tuple[int, tuple[int, ...], list[int]]] = []
+
+        if not self.layer_stacks:
+            return sink_constraint_ok, invalid_stacks
+
+        for stack_idx, stack in enumerate(self.layer_stacks):
+            nodes = [n for n in workload.node_list if n.id in stack]
+            if not nodes:
+                logger.warning(f"Stack {stack_idx} is empty.")
+                continue
+
+            sg = workload.get_subgraph(nodes)
+            sink_nodes = [
+                n
+                for n in sg.nodes()
+                if len(get_real_successors(n, sg)) == 0  # type: ignore[arg-type]
+            ]
+            sink_layer_ids = sorted(set(n.id for n in sink_nodes))
+            if len(sink_layer_ids) != 1:
+                sink_constraint_ok = False
+                invalid_stacks.append((stack_idx, stack, sink_layer_ids))
+
+        return sink_constraint_ok, invalid_stacks
 
     def cached_workload_matches(
         self, tiles: list[ComputationNode], cached_tiles: ComputationNodeWorkload
