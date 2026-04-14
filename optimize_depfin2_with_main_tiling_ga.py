@@ -1,0 +1,218 @@
+import argparse
+import json
+import logging
+from pathlib import Path
+from textwrap import dedent
+
+from main import optimize_single_hardware_co
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Example depfin2 flow using GA optimization of intra/inter tiling in main.optimize_single_hardware_co."
+    )
+    parser.add_argument(
+        "--experiment-id",
+        type=str,
+        default="depfin2-main-hw-and-tiling-ga",
+        help="Experiment folder under outputs/.",
+    )
+    parser.add_argument(
+        "--output-root",
+        type=str,
+        default="outputs",
+        help="Output root directory.",
+    )
+    parser.add_argument(
+        "--hw-pop-size",
+        type=int,
+        default=4,
+        help="Hardware GA population size.",
+    )
+    parser.add_argument(
+        "--hw-generations",
+        type=int,
+        default=2,
+        help="Hardware GA generations.",
+    )
+    parser.add_argument(
+        "--tiling-pop-size",
+        type=int,
+        default=24,
+        help="Tiling GA population size.",
+    )
+    parser.add_argument(
+        "--tiling-generations",
+        type=int,
+        default=6,
+        help="Tiling GA generations.",
+    )
+    parser.add_argument("--seed", type=int, default=42)
+    return parser.parse_args()
+
+
+def build_depfin2_layer_stacks() -> list[tuple[int, ...]]:
+    return [tuple(range(0, 12)), tuple(range(12, 22))] + [(i,) for i in range(22, 49)]
+
+
+def prepare_local_hardware_assets(run_dir: Path, depfin2_hw_dir: Path) -> None:
+    """Create local relative core links for strict accelerator path validation."""
+    cores_dir = run_dir / "cores"
+    cores_dir.mkdir(parents=True, exist_ok=True)
+
+    src_core = depfin2_hw_dir / "cores" / "core.yaml"
+    src_offchip = depfin2_hw_dir / "cores" / "offchip.yaml"
+
+    dst_core = cores_dir / "core.yaml"
+    dst_offchip = cores_dir / "offchip.yaml"
+
+    if dst_core.exists() or dst_core.is_symlink():
+        dst_core.unlink()
+    if dst_offchip.exists() or dst_offchip.is_symlink():
+        dst_offchip.unlink()
+
+    dst_core.symlink_to(src_core.resolve())
+    dst_offchip.symlink_to(src_offchip.resolve())
+
+
+def create_soc_template(template_path: Path) -> None:
+    template_content = dedent(
+        """
+        name: {{ soc_name | default('depfin2_main_tiling_ga_soc', true) }}
+        cores:
+          0: ./cores/core.yaml
+          1: ./cores/offchip.yaml
+        offchip_core_id: 1
+        unit_energy_cost: 0
+        core_connectivity:
+          - type: bus
+            cores: [0, 1]
+            bandwidth: {{ bus_bw | default(64, true) | float }}
+        """
+    ).lstrip()
+    template_path.write_text(template_content, encoding="utf-8")
+
+
+def build_tiling_options() -> tuple[
+    dict[int, list[list[tuple[str, int | str]]]],
+    dict[int, list[list[tuple[str, int | str]]]],
+]:
+    """Small generic candidate sets. Invalid dims for a node are ignored by the stage."""
+    node_ids = [*range(0, 49)]
+
+    intra_options: dict[int, list[list[tuple[str, int | str]]]] = {}
+    inter_options: dict[int, list[list[tuple[str, int | str]]]] = {}
+
+    for node_id in node_ids:
+        intra_options[node_id] = [
+            [],
+            [("OY", 2)],
+            [("K", 2)],
+        ]
+        inter_options[node_id] = [
+            [("K", 1)],
+            [("K", "*")],
+            [("OY", "*")],
+        ]
+
+    return intra_options, inter_options
+
+
+def main():
+    args = parse_args()
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
+    repo_root = Path(__file__).resolve().parent
+    depfin2_dir = repo_root / "inputs" / "depfin2"
+    depfin2_hw_dir = depfin2_dir / "hardware"
+    workload_path = depfin2_dir / "workload" / "fsrcnn.onnx"
+
+    run_dir = Path(args.output_root) / args.experiment_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    prepare_local_hardware_assets(run_dir, depfin2_hw_dir)
+    hw_template_path = run_dir / "soc_template_for_main_tiling_ga.yaml"
+    create_soc_template(hw_template_path)
+
+    template_params = {
+        "soc_name": "depfin2_main_tiling_ga_soc",
+        "bus_bw": 64,
+    }
+
+    core_template_path = depfin2_hw_dir / "cores" / "core_template.j2"
+    core_template_params = {
+        "rf_1b_i_size": 8,
+        "rf_1b_i_bw": 8,
+        "rf_1b_w_size": 8,
+        "rf_1b_w_bw": 8,
+        "rf_4b_size": 16,
+        "rf_4b_bw": 16,
+        "l1_w_size": 4_194_304,
+        "l1_w_bw": 128,
+        "l1_act_size": 8_388_608,
+        "l1_act_bw_min": 64,
+        "l1_act_bw_max": 1024,
+        "d1_size": 128,
+        "d2_size": 16,
+    }
+
+    hardware_ga_parameter_specs = [
+        {"name": "d1_size", "lower": 64, "upper": 256, "scale": 1},
+        {"name": "d2_size", "lower": 8, "upper": 32, "scale": 1},
+    ]
+
+    intra_tiling_options, inter_tiling_options = build_tiling_options()
+
+    logging.info("Starting optimize_single_hardware_co with hardware+tiling GA flow")
+    scme = optimize_single_hardware_co(
+        hardware_template=str(hw_template_path),
+        workload=str(workload_path),
+        mode="fused",
+        layer_stacks=build_depfin2_layer_stacks(),
+        experiment_id=args.experiment_id,
+        output_path=str(Path(args.output_root)),
+        skip_if_exists=False,
+        template_params=template_params,
+        hardware_ga_parameter_specs=hardware_ga_parameter_specs,
+        hardware_ga_core_template=str(core_template_path),
+        hardware_ga_core_template_params=core_template_params,
+        hardware_ga_target_core_id=0,
+        hardware_ga_generations=args.hw_generations,
+        hardware_ga_population=args.hw_pop_size,
+        hardware_ga_seed=args.seed,
+        intra_tiling_options=intra_tiling_options,
+        inter_tiling_options=inter_tiling_options,
+        tiling_ga_generations=args.tiling_generations,
+        tiling_ga_population=args.tiling_pop_size,
+        tiling_ga_seed=args.seed,
+        tiling_force_inter_wildcard=True,
+        tiling_weight_tiles=1.0,
+        tiling_weight_edges=1.0,
+        tiling_weight_inter_edges=2.0,
+        tiling_weight_inter_bits=1e-6,
+    )
+
+    summary = {
+        "experiment_id": args.experiment_id,
+        "latency": float(scme.latency),
+        "energy": float(scme.energy),
+        "area": float(scme.accelerator.area),
+        "hardware_template": str(hw_template_path),
+        "workload": str(workload_path),
+        "hardware_ga_population": args.hw_pop_size,
+        "hardware_ga_generations": args.hw_generations,
+        "tiling_ga_population": args.tiling_pop_size,
+        "tiling_ga_generations": args.tiling_generations,
+        "seed": args.seed,
+    }
+
+    summary_path = run_dir / "main_hw_tiling_ga_summary.json"
+    summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+    logging.info("Finished. Summary saved to %s", summary_path)
+    logging.info("Latency=%s Energy=%s Area=%s", summary["latency"], summary["energy"], summary["area"])
+
+
+if __name__ == "__main__":
+    main()
