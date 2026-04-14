@@ -49,7 +49,7 @@ def parse_args():
 
 
 def build_depfin2_layer_stacks() -> list[tuple[int, ...]]:
-    return [tuple(range(0, 12)), tuple(range(12, 22))] + [(i,) for i in range(22, 49)]
+    return [tuple(range(0, 8))]
 
 
 def build_manual_tiling_configurations() -> list[dict]:
@@ -86,6 +86,35 @@ def build_manual_tiling_configurations() -> list[dict]:
                 2: {
                     "intra": [("K", 2), ("OY", 8)],
                     "inter": [("K", "*")],
+                },
+            },
+        },
+        {
+            "name": "cfg1_output_heavy2",
+            "node_tilings": {
+                0: {
+                    "intra": [("OY", 960)],
+                },
+                1: {
+                    "intra": [("OY", 960)],
+                },
+                2: {
+                    "intra": [("OY", 960)],
+                },
+                3: {
+                    "intra": [("OY", 960)],
+                },
+                4: {
+                    "intra": [("OY", 960)],
+                },
+                5: {
+                    "intra": [("OY", 960)],
+                },
+                6: {
+                    "intra": [("OY", 960)],
+                },
+                7: {
+                    "intra": [("OY", 960)],
                 },
             },
         },

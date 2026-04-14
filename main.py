@@ -113,6 +113,7 @@ def optimize_single_hardware_co(  # noqa: PLR0913
     tiling_weight_inter_bits: float = 1e-6,
     tiling_configurations: list[dict] | None = None,
     selected_tiling_configuration_index: int = 0,
+    tiling_selection_goal: str = "fusion_heuristic",
 ) -> StreamCostModelEvaluation:
     _sanity_check_inputs(hardware_template, workload, mode, output_path)
     _sanity_check_gurobi_license()
@@ -193,6 +194,7 @@ def optimize_single_hardware_co(  # noqa: PLR0913
             tiling_weight_inter_bits=tiling_weight_inter_bits,
             tiling_configurations=tiling_configurations or [],
             selected_tiling_configuration_index=selected_tiling_configuration_index,
+            tiling_selection_goal=tiling_selection_goal,
         )
         # Launch the MainStage
         answers = mainstage.run()

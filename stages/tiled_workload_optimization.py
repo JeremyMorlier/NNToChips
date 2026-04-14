@@ -136,14 +136,14 @@ class TiledWorkloadGenerationStage2(Stage):
         self.selected_tiling_configuration_index = int(
             kwargs.get("selected_tiling_configuration_index", 0)
         )
+        self.tiling_selection_goal = str(
+            kwargs.get("tiling_selection_goal", "fusion_heuristic")
+        )
 
     def run(self):
         candidate_outputs = self._build_tiled_workload_candidates()
-        selected_idx = (
-            self.selected_tiling_configuration_index
-            if self.tiling_configurations
-            else 0
-        )
+        candidate_outputs = self._annotate_candidates_with_heuristics(candidate_outputs)
+        selected_idx = self._select_candidate_index(candidate_outputs)
         assert 0 <= selected_idx < len(candidate_outputs), (
             "selected_tiling_configuration_index is out of range. "
             f"Got {selected_idx} for {len(candidate_outputs)} candidate(s)."
@@ -173,6 +173,7 @@ class TiledWorkloadGenerationStage2(Stage):
         kwargs["tiled_workload_candidates"] = candidate_outputs
         kwargs["selected_tiling_configuration_index"] = selected_idx
         kwargs["selected_tiling_configuration"] = selected_output["configuration"]
+        kwargs["tiling_selection_goal"] = self.tiling_selection_goal
 
         if "scheduling_order" not in kwargs:
             kwargs["scheduling_order"] = self.get_scheduling_order(tiled_workload)
@@ -180,6 +181,105 @@ class TiledWorkloadGenerationStage2(Stage):
         yield from sub_stage.run()
 
         yield None, None
+
+    def _select_candidate_index(self, candidates: list[dict[str, Any]]) -> int:
+        if not self.tiling_configurations:
+            return 0
+
+        if self.tiling_selection_goal == "manual_index":
+            return self.selected_tiling_configuration_index
+
+        # Default: maximize fusion opportunities across layers.
+        best_idx = 0
+        best_score = float("-inf")
+        for candidate in candidates:
+            score = float(candidate["heuristics"]["fusion_score"])
+            if score > best_score:
+                best_score = score
+                best_idx = int(candidate["index"])
+        logger.info(
+            "Selected candidate %d from fusion heuristic (score=%.6f).",
+            best_idx,
+            best_score,
+        )
+        return best_idx
+
+    def _annotate_candidates_with_heuristics(
+        self, candidates: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        for candidate in candidates:
+            workload = candidate["workload"]
+            sink_constraint_ok, invalid_stacks = self._check_sink_nodes_constraint(
+                workload
+            )
+            heuristics = self._compute_fusion_heuristics(workload)
+            heuristics["sink_constraint_ok"] = sink_constraint_ok
+            heuristics["invalid_stacks"] = invalid_stacks
+            if not sink_constraint_ok:
+                heuristics["fusion_score"] = float("-inf")
+            candidate["heuristics"] = heuristics
+        return candidates
+
+    def _compute_fusion_heuristics(
+        self, workload: ComputationNodeWorkload
+    ) -> dict[str, Any]:
+        layer_to_stack: dict[int, int] = {}
+        for stack_idx, stack in enumerate(self.layer_stacks):
+            for layer_id in stack:
+                layer_to_stack[layer_id] = stack_idx
+
+        stack_expected_pairs: set[tuple[int, int]] = set()
+        for stack in self.layer_stacks:
+            stack_expected_pairs.update(zip(stack, stack[1:], strict=False))
+
+        same_stack_inter_layer_edges = 0
+        cross_stack_edges = 0
+        layer_pair_edge_counts: dict[tuple[int, int], int] = defaultdict(int)
+
+        for producer, consumer in workload.edges():
+            if not isinstance(producer, ComputationNode) or not isinstance(
+                consumer, ComputationNode
+            ):
+                continue
+            p_stack = layer_to_stack.get(producer.id)
+            c_stack = layer_to_stack.get(consumer.id)
+            if p_stack is None or c_stack is None:
+                continue
+            if p_stack == c_stack and producer.id != consumer.id:
+                same_stack_inter_layer_edges += 1
+                layer_pair_edge_counts[(producer.id, consumer.id)] += 1
+            elif p_stack != c_stack:
+                cross_stack_edges += 1
+
+        covered_pairs = set(layer_pair_edge_counts.keys())
+        distinct_layer_pairs = len(covered_pairs)
+        pair_coverage_ratio = (
+            float(len(covered_pairs & stack_expected_pairs))
+            / float(max(1, len(stack_expected_pairs)))
+            if self.layer_stacks
+            else 1.0
+        )
+        tile_count = len(workload.node_list)
+
+        # Higher is better:
+        # - reward layer-pair coverage and same-stack inter-layer connectivity
+        # - lightly penalize cross-stack edges and very large tile counts
+        fusion_score = (
+            8.0 * pair_coverage_ratio
+            + 2.0 * float(distinct_layer_pairs)
+            + 1.0 * float(same_stack_inter_layer_edges)
+            - 0.5 * float(cross_stack_edges)
+            - 0.001 * float(tile_count)
+        )
+
+        return {
+            "fusion_score": fusion_score,
+            "pair_coverage_ratio": pair_coverage_ratio,
+            "distinct_layer_pairs": distinct_layer_pairs,
+            "same_stack_inter_layer_edges": same_stack_inter_layer_edges,
+            "cross_stack_edges": cross_stack_edges,
+            "tile_count": tile_count,
+        }
 
     def _build_tiled_workload_candidates(self) -> list[dict[str, Any]]:
         if not self.tiling_configurations:
