@@ -29,6 +29,7 @@ from stream.stages.generation.scheduling_order_generation import (
 from stream.stages.generation.tiling_generation import TilingGenerationStage
 from stages.accelerator_template_parser import AcceleratorTemplateParserStage
 from stages.genetichardware import GeneticHardwareStage
+from stages.tiled_workload_optimization import TiledWorkloadGenerationStage2
 from stages.tiling_genetic_optimization import TilingGeneticOptimizationStage
 from stream.stages.parsing.onnx_model_parser import (
     ONNXModelParserStage as StreamONNXModelParserStage,
@@ -148,7 +149,7 @@ def optimize_single_hardware_co(  # noqa: PLR0913
                 AcceleratorTemplateParserStage,
                 StreamONNXModelParserStageNoMapping,
                 TilingGenerationStage,
-                TilingGeneticOptimizationStage,
+                TiledWorkloadGenerationStage2,
                 LayerStacksGenerationStage,
                 GeneticHardwareStage,
                 ZigZagCoreMappingEstimationStage,

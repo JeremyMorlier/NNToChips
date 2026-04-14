@@ -9,12 +9,15 @@ from main import optimize_single_hardware_co
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Test depfin2 optimization flow through main.optimize_single_hardware_co."
+        description=(
+            "Run depfin2 with main.optimize_single_hardware_co "
+            "(using TiledWorkloadGenerationStage2 inside main.py)."
+        )
     )
     parser.add_argument(
         "--experiment-id",
         type=str,
-        default="depfin2-main-ga-test",
+        default="depfin2-main-stage2-test",
         help="Experiment folder under outputs/.",
     )
     parser.add_argument(
@@ -27,25 +30,23 @@ def parse_args():
         "--pop-size",
         type=int,
         default=4,
-        help="Hardware GA population size inside GeneticHardwareStage.",
+        help="Hardware GA population size.",
     )
     parser.add_argument(
         "--generations",
         type=int,
         default=2,
-        help="Hardware GA generations inside GeneticHardwareStage.",
+        help="Hardware GA generations.",
     )
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
 
 
 def build_depfin2_layer_stacks() -> list[tuple[int, ...]]:
-    # Same default split currently used for depfin2 fsrcnn in this repo.
     return [tuple(range(0, 12)), tuple(range(12, 22))] + [(i,) for i in range(22, 49)]
 
 
 def prepare_local_hardware_assets(run_dir: Path, depfin2_hw_dir: Path) -> None:
-    """Create local relative core links for strict accelerator path validation."""
     cores_dir = run_dir / "cores"
     cores_dir.mkdir(parents=True, exist_ok=True)
 
@@ -67,7 +68,7 @@ def prepare_local_hardware_assets(run_dir: Path, depfin2_hw_dir: Path) -> None:
 def create_soc_template(template_path: Path) -> None:
     template_content = dedent(
         """
-        name: {{ soc_name | default('depfin2_main_test_soc', true) }}
+        name: {{ soc_name | default('depfin2_main_stage2_soc', true) }}
         cores:
           0: ./cores/core.yaml
           1: ./cores/offchip.yaml
@@ -85,7 +86,9 @@ def create_soc_template(template_path: Path) -> None:
 def main():
     args = parse_args()
 
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+    )
 
     repo_root = Path(__file__).resolve().parent
     depfin2_dir = repo_root / "inputs" / "depfin2"
@@ -95,13 +98,12 @@ def main():
     run_dir = Path(args.output_root) / args.experiment_id
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    # Local template used only for this test flow.
     prepare_local_hardware_assets(run_dir, depfin2_hw_dir)
-    hw_template_path = run_dir / "soc_template_for_main.yaml"
+    hw_template_path = run_dir / "soc_template_for_main_stage2.yaml"
     create_soc_template(hw_template_path)
 
     template_params = {
-        "soc_name": "depfin2_main_test_soc",
+        "soc_name": "depfin2_main_stage2_soc",
         "bus_bw": 64,
     }
 
@@ -122,13 +124,12 @@ def main():
         "d2_size": 16,
     }
 
-    # Hardware GA optimizes only core-template parameters.
     hardware_ga_parameter_specs = [
         {"name": "d1_size", "lower": 64, "upper": 256, "scale": 1},
         {"name": "d2_size", "lower": 8, "upper": 32, "scale": 1},
     ]
 
-    logging.info("Starting optimize_single_hardware_co test flow")
+    logging.info("Starting optimize_single_hardware_co depfin2 flow")
     scme = optimize_single_hardware_co(
         hardware_template=str(hw_template_path),
         workload=str(workload_path),
@@ -159,11 +160,16 @@ def main():
         "ga_seed": args.seed,
     }
 
-    summary_path = run_dir / "main_ga_summary.json"
+    summary_path = run_dir / "main_stage2_summary.json"
     summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
 
     logging.info("Finished. Summary saved to %s", summary_path)
-    logging.info("Latency=%s Energy=%s Area=%s", summary["latency"], summary["energy"], summary["area"])
+    logging.info(
+        "Latency=%s Energy=%s Area=%s",
+        summary["latency"],
+        summary["energy"],
+        summary["area"],
+    )
 
 
 if __name__ == "__main__":
