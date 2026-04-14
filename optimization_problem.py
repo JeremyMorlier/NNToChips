@@ -1,15 +1,33 @@
 from __future__ import annotations
 
+import copy
 import logging
+from multiprocessing import Pool
 import shutil
-from concurrent.futures import ThreadPoolExecutor
+import sys
 from dataclasses import dataclass
+from itertools import product
+from math import prod
 from pathlib import Path
-from typing import Callable, Literal, Sequence
+from typing import Any, Callable, Literal, Sequence
 
 import numpy as np
+from pymoo.algorithms.moo.nsga2 import NSGA2
 from pymoo.core.problem import Problem
+from pymoo.optimize import minimize
+from zigzag.utils import open_yaml
+
+from stages.tiled_workload_generation_optimization import TiledWorkloadGenerationStage
 from stream.api import optimize_allocation_co
+from stream.hardware.architecture.accelerator import Accelerator
+from stream.parser.accelerator_factory import AcceleratorFactory
+from stream.parser.accelerator_validator import AcceleratorValidator
+from stream.parser.mapping_parser import MappingParser
+from stream.parser.onnx.model import ONNXModelParser
+from stream.stages.generation.tiling_generation import TilingGenerationStage
+from stream.stages.stage import Stage, StageCallable
+from stream.workload.computation.computation_node import ComputationNode
+from stream.workload.onnx_workload import ComputationNodeWorkload, ONNXWorkload
 
 from utils import generate_run_id, render_template_to_file
 
@@ -18,6 +36,33 @@ PenaltyVectorFactory = Callable[[int], Sequence[float]]
 ConstraintFunction = Callable[[dict[str, float | int]], Sequence[float] | float]
 ObjectiveExtractor = Callable[[object], Sequence[float]]
 ContextEnricher = Callable[[dict[str, float | int]], dict[str, object]]
+HeuristicResult = float | tuple[float, dict[str, float]]
+GraphHeuristic = Callable[[ComputationNodeWorkload], HeuristicResult]
+
+
+class _StreamToLogger:
+	def __init__(self, logger: logging.Logger, level: int):
+		self.logger = logger
+		self.level = level
+		self._buffer = ""
+
+	def write(self, message: str) -> None:
+		if not message:
+			return
+
+		self._buffer += message
+		while "\n" in self._buffer:
+			line, self._buffer = self._buffer.split("\n", 1)
+			if line.strip():
+				self.logger.log(self.level, line.rstrip())
+
+	def flush(self) -> None:
+		if self._buffer.strip():
+			self.logger.log(self.level, self._buffer.rstrip())
+		self._buffer = ""
+
+	def isatty(self) -> bool:
+		return False
 
 
 @dataclass(frozen=True)
@@ -229,11 +274,51 @@ class StreamOptimizationProblem(Problem):
 		_ = params
 		return self.mapping_path
 
+	def _configure_eval_logging(self, eval_dir: Path) -> None:
+		"""Redirect root logger output for one evaluation to per-eval log files."""
+		log_folder = eval_dir / "logs"
+		log_folder.mkdir(parents=True, exist_ok=True)
+
+		root_logger = logging.getLogger()
+		for handler in root_logger.handlers[:]:
+			handler.close()
+			root_logger.removeHandler(handler)
+
+		root_logger.setLevel(logging.DEBUG)
+
+		error_handler = logging.FileHandler(log_folder / "error.log")
+		error_handler.setLevel(logging.ERROR)
+
+		warning_handler = logging.FileHandler(log_folder / "warning.log")
+		warning_handler.setLevel(logging.WARNING)
+
+		info_handler = logging.FileHandler(log_folder / "info.log")
+		info_handler.setLevel(logging.INFO)
+
+		formatter = logging.Formatter(
+			"%(asctime)s - %(processName)s - %(name)s - %(levelname)s - %(message)s"
+		)
+		error_handler.setFormatter(formatter)
+		warning_handler.setFormatter(formatter)
+		info_handler.setFormatter(formatter)
+
+		root_logger.addHandler(error_handler)
+		root_logger.addHandler(warning_handler)
+		root_logger.addHandler(info_handler)
+
+		sys.stdout = _StreamToLogger(root_logger, logging.INFO)
+		sys.stderr = _StreamToLogger(root_logger, logging.ERROR)
+
 	def _evaluate_single(self, task: tuple[str, np.ndarray]):
 		eval_id, x_np = task
 		x = [int(v) for v in x_np.tolist()]
 		eval_dir = self.root_dir / eval_id
 		eval_dir.mkdir(parents=True, exist_ok=True)
+
+		if self.n_processes > 1:
+			self._configure_eval_logging(eval_dir)
+
+		logging.info("%s: starting evaluation", eval_id)
 
 		params, hardware_context, workload_context = self._decode_parameters(x)
 		key = tuple(x)
@@ -257,11 +342,13 @@ class StreamOptimizationProblem(Problem):
 		if key in self.cache:
 			f = self.cache[key]
 			evaluation_failed = all(value >= 1e20 for value in f)
+			logging.info("%s: using cached result", eval_id)
 			return f, g_link, params, memory_areas, evaluation_failed
 
 		if any(val > 0 for val in g_link):
 			f = list(self.penalty_factory(self.n_obj))
 			self.cache[key] = f
+			logging.warning("%s: constraint violation, applying penalty", eval_id)
 			return f, g_link, params, memory_areas, False
 
 		try:
@@ -282,12 +369,15 @@ class StreamOptimizationProblem(Problem):
 			)
 			f = [float(v) for v in self.objective_extractor(scme)]
 			memory_areas = extract_memory_areas(scme)
+			logging.info("%s: evaluation succeeded with F=%s", eval_id, f)
 		except Exception as exc:
 			f = list(self.penalty_factory(self.n_obj))
 			evaluation_failed = True
 			(eval_dir / "error.txt").write_text(str(exc), encoding="utf-8")
+			logging.exception("%s: evaluation failed", eval_id)
 
 		self.cache[key] = f
+		logging.info("%s: evaluation completed", eval_id)
 		return f, g_link, params, memory_areas, evaluation_failed
 
 	def _evaluate(self, X: np.ndarray, out: dict, *args, **kwargs):
@@ -297,8 +387,8 @@ class StreamOptimizationProblem(Problem):
 		]
 
 		if self.n_processes > 1:
-			with ThreadPoolExecutor(max_workers=self.n_processes) as executor:
-				results = list(executor.map(self._evaluate_single, eval_tasks))
+			with Pool(processes=self.n_processes) as pool:
+				results = pool.map(self._evaluate_single, eval_tasks)
 		else:
 			results = [self._evaluate_single(task) for task in eval_tasks]
 
