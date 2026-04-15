@@ -235,6 +235,15 @@ class TiledWorkloadGenerationStage2(Stage):
             f" ({selected_output['name']})" if selected_output["name"] else "",
         )
         logger.info(f"Finer graph: {tiled_workload}.")
+        nb_different_compute_tiles = self.get_nb_different_compute_tiles(tiled_workload)
+        logger.info(
+            "Final tiled workload has %d different compute tile type(s).",
+            nb_different_compute_tiles,
+        )
+        selected_output.setdefault("heuristics", {})
+        selected_output["heuristics"]["nb_different_compute_tiles"] = (
+            nb_different_compute_tiles
+        )
 
         kwargs = self.kwargs.copy()
         kwargs["original_workload"] = pickle_deepcopy(self.workload)
@@ -244,6 +253,7 @@ class TiledWorkloadGenerationStage2(Stage):
         kwargs["selected_tiling_configuration_index"] = selected_idx
         kwargs["selected_tiling_configuration"] = selected_output["configuration"]
         kwargs["tiling_selection_goal"] = self.tiling_selection_goal
+        kwargs["nb_different_compute_tiles"] = nb_different_compute_tiles
 
         if "scheduling_order" not in kwargs:
             kwargs["scheduling_order"] = self.get_scheduling_order(tiled_workload)
@@ -260,19 +270,22 @@ class TiledWorkloadGenerationStage2(Stage):
             return self.selected_tiling_configuration_index
 
         # Default: maximize fusion opportunities across layers.
-        best_idx = 0
+        best_pos = 0
+        best_candidate_id = int(candidates[0]["index"])
         best_score = float("-inf")
-        for candidate in candidates:
+        for pos, candidate in enumerate(candidates):
             score = float(candidate["heuristics"]["fusion_score"])
             if score > best_score:
                 best_score = score
-                best_idx = int(candidate["index"])
+                best_pos = pos
+                best_candidate_id = int(candidate["index"])
         logger.info(
-            "Selected candidate %d from fusion heuristic (score=%.6f).",
-            best_idx,
+            "Selected candidate id=%d at position=%d from fusion heuristic (score=%.6f).",
+            best_candidate_id,
+            best_pos,
             best_score,
         )
-        return best_idx
+        return best_pos
 
     def _annotate_candidates_with_heuristics(
         self, candidates: list[dict[str, Any]]
@@ -323,6 +336,7 @@ class TiledWorkloadGenerationStage2(Stage):
             else 1.0
         )
         tile_count = len(workload.node_list)
+        nb_different_compute_tiles = self.get_nb_different_compute_tiles(workload)
 
         # Higher is better:
         # - reward layer-pair coverage and same-stack inter-layer connectivity
@@ -342,7 +356,33 @@ class TiledWorkloadGenerationStage2(Stage):
             "same_stack_inter_layer_edges": same_stack_inter_layer_edges,
             "cross_stack_edges": cross_stack_edges,
             "tile_count": tile_count,
+            "nb_different_compute_tiles": nb_different_compute_tiles,
         }
+
+    @staticmethod
+    def _compute_tile_dataflow_signature(node: ComputationNode) -> tuple[Any, ...]:
+        """Return a signature that groups tiles with the same compute dataflow behavior."""
+        layer_dim_sizes = tuple(
+            sorted((str(dim), int(size)) for dim, size in node.layer_dim_sizes.items())
+        )
+        return (
+            str(node.type),
+            layer_dim_sizes,
+            repr(node.dimension_relations),
+            repr(node.operand_precision),
+            repr(node.memory_operand_links),
+            repr(node.operand_dimensionality_order),
+            repr(node.spatial_mapping),
+        )
+
+    def get_nb_different_compute_tiles(self, workload: ComputationNodeWorkload) -> int:
+        """Count the number of different compute tile types in the tiled workload graph."""
+        signatures = {
+            self._compute_tile_dataflow_signature(node)
+            for node in workload.node_list
+            if isinstance(node, ComputationNode)
+        }
+        return len(signatures)
 
     def _build_tiled_workload_candidates(self) -> list[dict[str, Any]]:
         if self.tiling_configuration_optimization_method == "ga":
