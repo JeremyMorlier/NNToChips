@@ -16,7 +16,7 @@ _logging.basicConfig(level=_logging_level, format=_logging_format)
 accelerator = "inputs/depfin/hardware/soc.yaml"
 accelerator = "inputs/depfin2/hardware/soc.yaml"
 workload_path = "inputs/depfin2/workload/fsrcnn.onnx"
-mapping_path = "inputs/depfin2/mapping/mapping.yaml"
+mapping_path = "inputs/depfin2/mapping/mapping2.yaml"
 mode = "fused"
 layer_stacks = [tuple(range(0, 12)), tuple(range(12, 22))] + list(
     (i,) for i in range(22, 49)
